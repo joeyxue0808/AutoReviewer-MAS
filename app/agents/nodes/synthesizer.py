@@ -109,7 +109,7 @@ def _resolve_conflicts(
         # 多个 block 修改同一文件，检查 search 区域重叠
         used_ranges: List[str] = []
         for block in file_blocks:
-            search = block.get("search", "")
+            search = block.get("search_block", block.get("search", ""))
             # 简化判断：search 内容有重叠即视为冲突
             is_conflict = False
             for used in used_ranges:

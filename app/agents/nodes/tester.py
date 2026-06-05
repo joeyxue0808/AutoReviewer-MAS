@@ -55,6 +55,8 @@ async def tester_node(state: ReviewState) -> Dict[str, Any]:
         }
 
     # 按语言分组执行测试
+    # Implementation Guide Phase 4 Task 4.2:
+    # TesterNode 只传 language 枚举，沙盒内部查询白名单命令
     all_logs: list[str] = []
     all_passed = True
 
@@ -78,9 +80,9 @@ async def tester_node(state: ReviewState) -> Dict[str, Any]:
 
         sandbox = _get_sandbox_engine()
         try:
-            result: SandboxResult = await sandbox.run(
-                image=lang_config.image,
-                command=lang_config.test_command,
+            # 只传 language 枚举，沙盒内部查询白名单命令
+            result: SandboxResult = await sandbox.run_by_language(
+                language=lang,
                 source_files=source_files,
                 search_replace_blocks=lang_blocks,
                 timeout=settings.sandbox.timeout,

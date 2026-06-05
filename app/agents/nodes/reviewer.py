@@ -49,8 +49,9 @@ async def reviewer_node(state: ReviewState) -> Dict[str, Any]:
         detected,
     )
 
-    # 获取 LLM 并绑定工具
-    llm = get_llm("reviewer")
+    # 获取 LLM 并绑定工具（trace_id 关联 Langfuse 监控）
+    trace_id = f"{state.get('vcs_provider', 'cli')}-{state.get('pr_id', 'local')}"
+    llm = get_llm("reviewer", trace_id=trace_id)
     llm_with_tools = llm.bind_tools(TOOLS)
 
     # 构建 diff_chunks 可读文本

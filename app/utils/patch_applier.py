@@ -90,8 +90,8 @@ class PatchApplier:
 
         for i, block in enumerate(blocks):
             file_path = block.get("file_path", "")
-            search = block.get("search", "")
-            replace = block.get("replace", "")
+            search = block.get("search_block", block.get("search", ""))
+            replace = block.get("replace_block", block.get("replace", ""))
 
             # 校验 Block 字段完整性
             if not file_path:
@@ -160,8 +160,8 @@ class PatchApplier:
 
         for i, block in enumerate(blocks):
             file_path = block.get("file_path", "")
-            search = block.get("search", "")
-            replace = block.get("replace", "")
+            search = block.get("search_block", block.get("search", ""))
+            replace = block.get("replace_block", block.get("replace", ""))
 
             if not file_path or not search:
                 results.append(ApplyResult(

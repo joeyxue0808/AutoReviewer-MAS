@@ -53,8 +53,9 @@ async def critic_node(state: ReviewState) -> Dict[str, Any]:
     # 格式化 blocks 为可读文本
     blocks_text = _format_blocks(blocks)
 
-    # 使用低延迟小模型（tester 角色，temperature=0.1）
-    llm = get_llm("tester")
+    # 使用低延迟小模型（tester 角色，temperature=0.0）
+    trace_id = f"{state.get('vcs_provider', 'cli')}-{state.get('pr_id', 'local')}"
+    llm = get_llm("tester", trace_id=trace_id)
 
     messages = [
         SystemMessage(content=CRITIC_SYSTEM_PROMPT),
@@ -93,8 +94,8 @@ def _format_blocks(blocks: list) -> str:
     lines = []
     for i, block in enumerate(blocks, 1):
         fp = block.get("file_path", "?")
-        search = block.get("search", "")[:200]
-        replace = block.get("replace", "")[:200]
+        search = block.get("search_block", block.get("search", ""))[:200]
+        replace = block.get("replace_block", block.get("replace", ""))[:200]
         lines.append(
             f"Block #{i}: {fp}\n"
             f"  search ({len(block.get('search', ''))} chars): {search!r}...\n"

@@ -38,7 +38,8 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
         state["retry_count"],
     )
 
-    llm = get_llm("fixer")
+    trace_id = f"{state.get('vcs_provider', 'cli')}-{state.get('pr_id', 'local')}"
+    llm = get_llm("fixer", trace_id=trace_id)
     llm_with_tools = llm.bind_tools(TOOLS)
 
     detected = state.get("detected_languages", [])
@@ -130,9 +131,8 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
     blocks: List[Dict[str, Any]] = [
         {
             "file_path": block.file_path,
-            "search": block.search,
-            "replace": block.replace,
-            "start_line": block.start_line,
+            "search_block": block.search_block,
+            "replace_block": block.replace_block,
             "context_before": block.context_before,
             "context_after": block.context_after,
         }

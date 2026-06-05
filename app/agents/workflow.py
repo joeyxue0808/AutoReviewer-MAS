@@ -1,18 +1,17 @@
-"""LangGraph 状态图编排 - Phase 3 Map-Reduce 并发拓扑。
+"""LangGraph 状态图编排 - Map-Reduce 并发拓扑。
 
-V2 流转逻辑：
-    reviewer_node → (critical?) → fixer_node → tester_node → (pass/retry?)
-                                        ↑           ↓
-                                        └───────────┘
-
-Phase 3 增强：
-    router_node → (需要并发?)
-        ├─ Yes → fan_out_node (多 reviewer 并行) → synthesizer_node
-        └─ No  → reviewer_node
+流转逻辑：
+    router_node → Send API 动态分发
+        ├─ 大 MR → 并发多个 reviewer_node (每个处理一个 DiffChunk)
+        └─ 小 MR → 单个 reviewer_node
                                                     ↓
                                               fixer_node → critic_node → tester_node
                                                 ↑              ↓
                                                 └── (reject) ──┘
+
+死循环阻断：
+    tester_node 之后，retry_count >= 3 时强制终止，
+    降级到 submit_node 提交已有结果，从物理层面斩断无限重试环。
 """
 
 import logging
@@ -23,95 +22,89 @@ from langgraph.graph import END, StateGraph
 from app.agents.nodes.critic import critic_node
 from app.agents.nodes.fixer import fixer_node
 from app.agents.nodes.reviewer import reviewer_node
-from app.agents.nodes.router import build_sub_states, should_fan_out
 from app.agents.nodes.synthesizer import synthesize_results
 from app.agents.nodes.tester import tester_node
 from app.core.config import settings
+from app.core.diff_analyzer import DiffAnalyzer, DiffChunk
 from app.schemas.state import ReviewState
 
 logger = logging.getLogger(__name__)
 
+# DiffAnalyzer 实例（用于 router 切片）
+_analyzer = DiffAnalyzer()
+
 
 # ─────────────────────────────────────────────
-# Router 节点
+# Router 节点：动态切片 + Send API 分发
 # ─────────────────────────────────────────────
 
 
-async def router_node(state: ReviewState) -> Dict[str, Any]:
-    """路由决策节点。
+def router_node(state: ReviewState) -> List[Dict[str, Any]]:
+    """路由决策节点：使用 LangGraph Send API 实现动态 Map-Reduce。
 
-    判断是否需要触发 Map-Reduce 并发路由。
-    结果存储在 state["_routing_mode"] 中供条件边使用。
+    根据 diff_chunks 的大小决定：
+    - 大 MR：切分为多个 DiffChunk，通过 Send 并发分发给多个 reviewer_node
+    - 小 MR：直接发送给单个 reviewer_node
+
+    Returns:
+        Send 指令列表，每个元素是要发送给 reviewer_node 的状态片段
     """
-    if should_fan_out(state):
-        logger.info("Router: 触发并发路由")
-        return {"_routing_mode": "fan_out"}
-    else:
-        logger.info("Router: 走串行流程")
-        return {"_routing_mode": "serial"}
+    from langgraph.types import Send
+
+    diff_chunks = state.get("diff_chunks", {})
+    detected = state.get("detected_languages", [])
+
+    # 将 diff_chunks 合并为完整 diff 文本用于重新切片
+    full_diff = "\n".join(diff_chunks.values()) if diff_chunks else ""
+
+    if not full_diff:
+        # 无 diff 内容，直接发送空状态
+        return [Send("reviewer_node", _make_sub_state(state, "__empty__", "", detected))]
+
+    # 使用 DiffAnalyzer 按 token 上限切片
+    chunks = _analyzer.chunk_diff(full_diff)
+
+    if len(chunks) <= 1:
+        # 小 MR，单 reviewer 处理
+        chunk = chunks[0] if chunks else DiffChunk("__empty__", "", "", 0, 0)
+        logger.info("Router: 小 MR，单 reviewer 处理 (%s)", chunk.chunk_id)
+        return [Send("reviewer_node", _make_sub_state(state, chunk.chunk_id, chunk.content, [chunk.language]))]
+
+    # 大 MR，按 Chunk 并发分发
+    logger.info("Router: 大 MR，%d 个 Chunk 并发分发", len(chunks))
+    sends = []
+    for chunk in chunks:
+        sends.append(
+            Send("reviewer_node", _make_sub_state(state, chunk.chunk_id, chunk.content, [chunk.language]))
+        )
+    return sends
 
 
-# ─────────────────────────────────────────────
-# Fan-Out 节点：并发执行多个 reviewer_node
-# ─────────────────────────────────────────────
-
-
-async def fan_out_node(state: ReviewState) -> Dict[str, Any]:
-    """并发执行节点：拆分 SubState 并并发调用 reviewer_node + fixer_node。
-
-    内部实现并发，不依赖 LangGraph Send API，
-    使用 asyncio.gather 并发执行所有子任务。
-    """
-    import asyncio
-
-    sub_states = build_sub_states(state)
-
-    logger.info("Fan-Out: 并发处理 %d 个子任务", len(sub_states))
-
-    async def _process_sub(sub_state: Dict[str, Any]) -> Dict[str, Any]:
-        """处理单个子任务：reviewer → fixer。"""
-        lang = sub_state.get("detected_languages", ["?"])[0]
-
-        # Reviewer
-        review_result = await reviewer_node(sub_state)
-        sub_state.update(review_result)
-
-        # 如果有 critical 问题，执行 fixer
-        critical = [
-            i for i in sub_state.get("review_issues", [])
-            if (i.get("severity") if isinstance(i, dict) else getattr(i, "severity", "")) == "critical"
-        ]
-        if critical:
-            fix_result = await fixer_node(sub_state)
-            sub_state.update(fix_result)
-
-        return sub_state
-
-    # 并发执行所有子任务
-    results = await asyncio.gather(
-        *[_process_sub(sub) for sub in sub_states],
-        return_exceptions=True,
-    )
-
-    # 过滤异常结果
-    valid_results = [r for r in results if isinstance(r, dict)]
-
-    # Synthesizer 汇总
-    merged = synthesize_results(state, valid_results)
-    return merged
+def _make_sub_state(
+    parent: ReviewState,
+    chunk_id: str,
+    diff_content: str,
+    languages: List[str],
+) -> Dict[str, Any]:
+    """构建发送给 reviewer_node 的子状态。"""
+    return {
+        "vcs_provider": parent.get("vcs_provider", ""),
+        "pr_id": parent.get("pr_id", ""),
+        "trigger_type": parent.get("trigger_type", "webhook_pr"),
+        "repo_context": parent.get("repo_context", ""),
+        "diff_chunks": {chunk_id: diff_content} if diff_content else {},
+        "detected_languages": languages,
+        "review_issues": [],
+        "search_replace_blocks": [],
+        "test_logs": "",
+        "is_test_passed": False,
+        "retry_count": 0,
+    }
 
 
 # ─────────────────────────────────────────────
 # 条件路由函数
 # ─────────────────────────────────────────────
-
-
-def _after_router(state: ReviewState) -> Literal["fan_out_node", "reviewer_node"]:
-    """Router 之后的条件路由。"""
-    mode = state.get("_routing_mode", "serial")
-    if mode == "fan_out":
-        return "fan_out_node"
-    return "reviewer_node"
 
 
 def _after_reviewer(state: ReviewState) -> Literal["fixer_node", "__end__"]:
@@ -131,7 +124,6 @@ def _after_reviewer(state: ReviewState) -> Literal["fixer_node", "__end__"]:
 
 def _after_critic(state: ReviewState) -> Literal["tester_node", "fixer_node"]:
     """Critic 之后：通过 → tester，拒绝 → 回到 fixer。"""
-    # 如果 blocks 被清空（Critic 拒绝），回到 fixer
     blocks = state.get("search_replace_blocks", [])
     if not blocks and state.get("test_logs", "").startswith("Critic 拒绝"):
         logger.info("Critic 拒绝，回到 fixer 重试")
@@ -141,22 +133,49 @@ def _after_critic(state: ReviewState) -> Literal["tester_node", "fixer_node"]:
     return "tester_node"
 
 
-def _after_tester(state: ReviewState) -> Literal["fixer_node", "__end__"]:
-    """Tester 之后：通过或达到重试上限 → END，否则 → fixer。"""
+def _after_tester(state: ReviewState) -> Literal["fixer_node", "submit_node"]:
+    """Tester 之后的死循环硬阻断路由。
+
+    规则（严格遵循 Implementation Guide Phase 1 Task 1.2）：
+    - 测试通过 → submit_node
+    - retry_count >= 3 → 强制终止，降级到 submit_node（提交已有结果）
+    - retry_count < 3 且未通过 → 回到 fixer_node 重试
+    """
     is_passed = state.get("is_test_passed", False)
     retry_count = state.get("retry_count", 0)
     max_retries = settings.max_retry_count
 
     if is_passed:
-        logger.info("测试通过，流程结束")
-        return "__end__"
+        logger.info("测试通过，进入 submit")
+        return "submit_node"
 
+    # 【硬阻断】物理层面斩断无限重试环
     if retry_count >= max_retries:
-        logger.warning("已达最大重试次数 (%d/%d)，流程结束（降级）", retry_count, max_retries)
-        return "__end__"
+        logger.warning(
+            "已达最大重试次数 (%d/%d)，强制终止，降级提交已有结果",
+            retry_count, max_retries,
+        )
+        return "submit_node"
 
     logger.info("测试未通过，重试 (%d/%d): 回到 fixer 节点", retry_count, max_retries)
     return "fixer_node"
+
+
+# ─────────────────────────────────────────────
+# 合并节点：汇总并发结果
+# ─────────────────────────────────────────────
+
+
+async def merge_node(state: ReviewState) -> Dict[str, Any]:
+    """汇总并发 reviewer 的结果。
+
+    当 Send API 并发多个 reviewer_node 时，
+    LangGraph 会自动收集结果到 state 中。
+    此节点用于记录汇总日志。
+    """
+    issues = state.get("review_issues", [])
+    logger.info("Merge: 汇总 %d 个 review_issues", len(issues))
+    return {}
 
 
 # ─────────────────────────────────────────────
@@ -172,14 +191,16 @@ async def submit_node(state: ReviewState) -> Dict[str, Any]:
 
     vcs_provider = state.get("vcs_provider", "gitlab")
     pr_id = state.get("pr_id", "")
+    retry_count = state.get("retry_count", 0)
 
     logger.info(
         "Submit 节点: vcs=%s, pr=%s, is_test_passed=%s, retry_count=%d",
         vcs_provider, pr_id,
         state.get("is_test_passed", False),
-        state.get("retry_count", 0),
+        retry_count,
     )
 
+    # 如果是降级提交（达到重试上限），在报告中标注
     report = _format_review_report(state)
     provider = _create_vcs_provider(vcs_provider)
 
@@ -229,6 +250,11 @@ def _format_review_report(state: ReviewState) -> str:
     status_icon = "✅" if is_passed else "❌"
     parts = [f"## 🤖 AutoReviewer-MAS 审查报告 {status_icon}", ""]
 
+    # 降级提交标注
+    if retry_count >= settings.max_retry_count and not is_passed:
+        parts.append("> ⚠️ **降级提交**：已达最大重试次数，以下为未完全验证的审查结果")
+        parts.append("")
+
     if issues:
         parts.append(f"### 发现 {len(issues)} 个问题 (重试 {retry_count} 次)")
         parts.append("")
@@ -260,44 +286,29 @@ def _format_review_report(state: ReviewState) -> str:
 
 
 # ─────────────────────────────────────────────
-# 构建并编译 StateGraph (Phase 3 拓扑)
+# 构建并编译 StateGraph
 # ─────────────────────────────────────────────
 
 
 def build_graph() -> StateGraph:
-    """构建 Phase 3 LangGraph StateGraph。
+    """构建 LangGraph StateGraph。
 
     拓扑：
-        router → (fan_out | serial reviewer) → fixer → critic → tester → submit
-                  ↑                                     ↓
-                  └──── (critic reject / test fail) ─────┘
+        router → Send(reviewer) → fixer → critic → tester → submit → END
+                  ↑                        ↓
+                  └── (retry < 3) ─────────┘
     """
     graph = StateGraph(ReviewState)
 
-    # 添加所有节点
-    graph.add_node("router_node", router_node)
-    graph.add_node("fan_out_node", fan_out_node)
+    # 添加节点
     graph.add_node("reviewer_node", reviewer_node)
     graph.add_node("fixer_node", fixer_node)
     graph.add_node("critic_node", critic_node)
     graph.add_node("tester_node", tester_node)
     graph.add_node("submit_node", submit_node)
 
-    # 入口
-    graph.set_entry_point("router_node")
-
-    # router → (fan_out | reviewer)
-    graph.add_conditional_edges(
-        "router_node",
-        _after_router,
-        {
-            "fan_out_node": "fan_out_node",
-            "reviewer_node": "reviewer_node",
-        },
-    )
-
-    # fan_out → fixer（fan_out 内部已完成 reviewer+fixer，直接到 fixer 汇总）
-    graph.add_edge("fan_out_node", "fixer_node")
+    # router 使用 Send API 动态分发
+    graph.add_conditional_edges("__start__", router_node)
 
     # reviewer → (fixer | END)
     graph.add_conditional_edges(
@@ -316,11 +327,11 @@ def build_graph() -> StateGraph:
         {"tester_node": "tester_node", "fixer_node": "fixer_node"},
     )
 
-    # tester → (fixer | submit → END)
+    # tester → (fixer | submit) — 死循环硬阻断
     graph.add_conditional_edges(
         "tester_node",
         _after_tester,
-        {"fixer_node": "fixer_node", "__end__": "submit_node"},
+        {"fixer_node": "fixer_node", "submit_node": "submit_node"},
     )
 
     # submit → END
@@ -330,13 +341,7 @@ def build_graph() -> StateGraph:
 
 
 def compile_graph(checkpointer=None, interrupt_before: list[str] | None = None):
-    """编译 Graph，可选注入 Checkpointer 和 HITL 中断点。
-
-    Args:
-        checkpointer: LangGraph Checkpointer 实例（Phase 1 持久化）
-        interrupt_before: 在指定节点前挂起 Graph（Phase 4 HITL）
-                          默认 ["submit_node"]，即提交前需要人工确认
-    """
+    """编译 Graph，可选注入 Checkpointer 和 HITL 中断点。"""
     graph_builder = build_graph()
     kwargs: dict = {}
     if checkpointer:
@@ -344,7 +349,6 @@ def compile_graph(checkpointer=None, interrupt_before: list[str] | None = None):
     if interrupt_before is not None:
         kwargs["interrupt_before"] = interrupt_before
     else:
-        # 默认在 submit_node 前挂起（HITL）
         kwargs["interrupt_before"] = ["submit_node"]
     return graph_builder.compile(**kwargs)
 
