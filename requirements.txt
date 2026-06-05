@@ -1,0 +1,45 @@
+# AutoReviewer-MAS Dependencies
+
+# Web framework
+fastapi>=0.115.0
+uvicorn>=0.32.0
+
+# LangChain ecosystem
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
+
+# Config management
+pydantic>=2.0
+pydantic-settings>=2.0
+pyyaml>=6.0
+
+# Retry mechanism
+tenacity>=9.0
+
+# Docker sandbox
+docker>=7.0
+
+# VCS clients
+python-gitlab>=4.0
+aiohttp>=3.10
+
+# Phase 1: Message queue (Redis Streams)
+redis>=5.0
+
+# Phase 1: LangGraph checkpointer (Postgres)
+langgraph-checkpoint-postgres>=2.0
+
+# Phase 1: Circuit breaker
+pybreaker>=1.0
+
+# Postgres async driver (for checkpointer)
+psycopg[binary]>=3.1
+
+# Phase 2: AST analysis (optional, for ast_find_references)
+tree-sitter>=0.22
+
+# Phase 4: CLI terminal mode
+typer>=0.12.0
+rich>=13.0
