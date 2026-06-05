@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +21,37 @@ _SKIP_DIRS = {
 }
 
 
-@tool
+class ListDirectoryInput(BaseModel):
+    """list_directory 的输入 Schema（防止参数幻觉）。"""
+
+    dir_path: str = Field(
+        default=".",
+        description="要探查的目录相对路径（如 'src/auth'），默认为仓库根目录",
+    )
+    max_depth: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="最大递归深度（1-5，防止输出过大）",
+    )
+    repo_path: str = Field(
+        default=".",
+        description="仓库根目录路径",
+    )
+
+
+@tool(args_schema=ListDirectoryInput)
 async def list_directory(
     dir_path: str = ".",
     max_depth: int = 3,
     repo_path: str = ".",
 ) -> str:
-    """探查指定目录的文件树结构。
+    """探查指定目录的文件树结构（只读）。
 
     当你遇到不熟悉的模块或包时，调用此工具快速了解其组织结构。
     返回目录树和关键文件列表。
+
+    安全约束：此工具只读，不会修改任何文件。
 
     Args:
         dir_path: 要探查的目录相对路径（如 "src/auth"），默认为仓库根目录

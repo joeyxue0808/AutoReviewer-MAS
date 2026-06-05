@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -52,17 +53,42 @@ _SUFFIX_LANG = {
 }
 
 
-@tool
+class FindReferencesInput(BaseModel):
+    """ast_find_references 的输入 Schema（防止参数幻觉）。"""
+
+    symbol: str = Field(
+        min_length=2,
+        description="要搜索的符号名称（如 'handleAuth', 'UserService'）",
+    )
+    file_extensions: Optional[list[str]] = Field(
+        default=None,
+        description="限制搜索的文件后缀（如 ['.py', '.go']），默认搜索所有代码文件",
+    )
+    repo_path: str = Field(
+        default=".",
+        description="仓库根目录路径",
+    )
+    max_results: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="最大返回结果数",
+    )
+
+
+@tool(args_schema=FindReferencesInput)
 async def ast_find_references(
     symbol: str,
     file_extensions: Optional[list[str]] = None,
     repo_path: str = ".",
     max_results: int = 50,
 ) -> str:
-    """在代码仓库中搜索指定符号（函数/类/变量）的所有引用位置。
+    """在代码仓库中搜索指定符号（函数/类/变量）的所有引用位置（只读）。
 
     当你发现某个函数或类被修改时，调用此工具检查是否有其他文件依赖它，
     避免修改后破坏向下兼容性。
+
+    安全约束：此工具只读，不会修改任何文件。
 
     Args:
         symbol: 要搜索的符号名称（如 "handleAuth", "UserService", "MAX_RETRY"）
