@@ -150,10 +150,15 @@ async def main():
     _setup_logging()
     logger.info("AutoReviewer-MAS Worker 启动中...")
 
-    # 信号处理
+    # 信号处理（Windows 不支持 add_signal_handler，使用线程兼容方案）
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: _shutdown.set())
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: _shutdown.set())
+    except NotImplementedError:
+        # Windows 回退：用 signal.signal 在主线程注册
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda s, f: _shutdown.set())
 
     # 连接队列
     await review_queue.connect()
@@ -178,4 +183,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import platform
+    import selectors
+
+    if platform.system() == "Windows":
+        # Windows: psycopg 要求 SelectorEventLoop，不能用默认的 ProactorEventLoop
+        asyncio.run(main(), loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()))
+    else:
+        asyncio.run(main())

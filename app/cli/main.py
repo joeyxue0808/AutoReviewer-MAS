@@ -20,6 +20,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows 控制台默认 GBK 编码，强制 UTF-8 以支持 emoji 和中文
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import typer
 from rich.console import Console
 from rich.live import Live
@@ -47,6 +52,9 @@ def _setup_logging(verbose: bool = False) -> None:
         format="%(message)s",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
     )
+    # 抑制 httpx/httpcore 的 HTTP 请求日志（每次 LLM 调用都刷屏）
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _get_git_diff(staged: bool = True) -> str:
@@ -60,7 +68,7 @@ def _get_git_diff(staged: bool = True) -> str:
     """
     cmd = ["git", "diff", "--cached"] if staged else ["git", "diff"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", check=True)
         return result.stdout
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Git diff 失败: {e.stderr}[/red]")
@@ -72,7 +80,7 @@ def _get_git_branch() -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, check=True,
+            capture_output=True, encoding="utf-8", errors="replace", check=True,
         )
         return result.stdout.strip()
     except Exception:
@@ -84,7 +92,7 @@ def _get_repo_root() -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True,
+            capture_output=True, encoding="utf-8", errors="replace", check=True,
         )
         return result.stdout.strip()
     except Exception:
