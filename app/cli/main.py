@@ -222,7 +222,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
 
 
 def _display_results(state: dict) -> None:
-    """在终端显示审查结果。"""
+    """在终端显示审查结果（完整版，不截断关键内容）。"""
     issues = state.get("review_issues", [])
     blocks = state.get("search_replace_blocks", [])
     test_logs = state.get("test_logs", "")
@@ -231,53 +231,123 @@ def _display_results(state: dict) -> None:
 
     console.print()
 
-    # 审查问题
+    # ── 审查问题 ──
     if issues:
-        tree = Tree(f"🔍 发现 [bold]{len(issues)}[/bold] 个问题 (重试 {retry_count} 次)")
+        severity_counts = {"critical": 0, "warning": 0, "info": 0}
+        for issue in issues:
+            sev = issue.get("severity", "info")
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
-        severity_style = {
-            "critical": "bold red",
-            "warning": "yellow",
-            "info": "blue",
-        }
+        badges = []
+        if severity_counts["critical"]:
+            badges.append(f"[bold red]🔴 critical {severity_counts['critical']}[/bold red]")
+        if severity_counts["warning"]:
+            badges.append(f"[yellow]🟡 warning {severity_counts['warning']}[/yellow]")
+        if severity_counts["info"]:
+            badges.append(f"[blue]🔵 info {severity_counts['info']}[/blue]")
+
+        header = f"🔍 审查报告 — {len(issues)} 个问题  {' │ '.join(badges)}"
+        if retry_count > 0:
+            header += f"  [dim](重试 {retry_count} 次)[/dim]"
+
+        # 每个 issue 用独立 Panel 展示，避免表格截断
+        console.print(Panel(header, style="bold", border_style="blue"))
+        console.print()
+
+        sev_style = {"critical": "bold red", "warning": "yellow", "info": "cyan"}
+        sev_icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
 
         for i, issue in enumerate(issues, 1):
             sev = issue.get("severity", "info")
-            style = severity_style.get(sev, "white")
             fp = issue.get("file_path", "")
             ln = issue.get("line_number", "")
             desc = issue.get("description", "")
             sug = issue.get("suggestion", "")
 
-            node = tree.add(f"[{style}]{i}. [{sev.upper()}][/] {fp}:{ln}")
-            node.add(f"[dim]{desc}[/dim]")
+            # 构建单个 issue 的内容
+            loc = f"{fp}:{ln}" if ln else fp
+            content = f"[{sev_style.get(sev, 'white')}]{sev_icon.get(sev, '•')} [{sev.upper()}][/] [cyan]{loc}[/cyan]\n\n"
+            content += f"{desc}\n"
             if sug:
-                node.add(f"[green]💡 {sug}[/green]")
+                content += f"\n[green]💡 建议:[/green] {sug}"
 
-        console.print(tree)
+            console.print(Panel(
+                content,
+                title=f"[dim]#{i}[/dim]",
+                border_style=sev_style.get(sev, "white"),
+                padding=(0, 1),
+            ))
     else:
-        console.print("[green]✅ 未发现问题[/green]")
+        console.print(Panel(
+            "[bold green]✅ 未发现问题 — 代码审查通过[/bold green]",
+            border_style="green",
+            padding=(0, 2),
+        ))
 
-    # Search/Replace Blocks
+    # ── Search/Replace Blocks ──
     if blocks:
         console.print()
-        console.print(f"[cyan]📝 生成 {len(blocks)} 个修复块:[/cyan]")
+        console.print(Panel(
+            f"[bold cyan]📝 生成 {len(blocks)} 个修复块[/bold cyan]",
+            border_style="cyan",
+            padding=(0, 1),
+        ))
+        console.print()
+
         for i, block in enumerate(blocks, 1):
             fp = block.get("file_path", "")
-            search = block.get("search_block", block.get("search", ""))[:100]
-            replace = block.get("replace_block", block.get("replace", ""))[:100]
-            console.print(f"  {i}. [cyan]{fp}[/cyan]")
-            console.print(f"     [red]- {search!r}...[/red]")
-            console.print(f"     [green]+ {replace!r}...[/green]")
+            search = block.get("search_block", block.get("search", ""))
+            replace = block.get("replace_block", block.get("replace", ""))
 
-    # 测试结果
+            # 用完整 diff 格式展示，不截断
+            diff_lines = []
+            diff_lines.append(f"--- a/{fp}")
+            diff_lines.append(f"+++ b/{fp}")
+            diff_lines.append("")
+            for line in search.splitlines():
+                diff_lines.append(f"- {line}")
+            diff_lines.append("")
+            for line in replace.splitlines():
+                diff_lines.append(f"+ {line}")
+
+            diff_text = "\n".join(diff_lines)
+
+            console.print(Panel(
+                Syntax(diff_text, "diff", theme="monokai", line_numbers=False, word_wrap=True),
+                title=f"[cyan]Block #{i}[/cyan] — [dim]{fp}[/dim]",
+                border_style="bright_black",
+                padding=(0, 1),
+            ))
+
+    # ── 测试结果 ──
     if test_logs:
+        status = "[bold green]✅ 通过[/bold green]" if is_passed else "[bold red]❌ 失败[/bold red]"
         console.print()
-        status = "✅ 通过" if is_passed else "❌ 失败"
         console.print(Panel(
-            Syntax(test_logs[:1000], "text", theme="monokai"),
+            Syntax(test_logs, "text", theme="monokai", word_wrap=True),
             title=f"🧪 测试结果: {status}",
             border_style="green" if is_passed else "red",
+        ))
+
+    # ── 最终状态 ──
+    console.print()
+    if is_passed:
+        console.print(Panel(
+            "[bold green]🎉 审查完成 — 测试通过，代码可合并[/bold green]",
+            border_style="green",
+            padding=(0, 2),
+        ))
+    elif retry_count >= 3:
+        console.print(Panel(
+            "[bold yellow]⚠️  审查完成 — 达到最大重试次数，降级提交已有结果[/bold yellow]",
+            border_style="yellow",
+            padding=(0, 2),
+        ))
+    else:
+        console.print(Panel(
+            "[bold red]❌ 审查完成 — 存在未解决问题[/bold red]",
+            border_style="red",
+            padding=(0, 2),
         ))
 
 
