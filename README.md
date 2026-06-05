@@ -45,10 +45,10 @@ Supports both **GitLab** and **GitHub** — just configure the tokens.
 ### 🧠 Multi-Agent Collaboration
 | Agent | Role | Responsibility |
 |:---:|:---|:---|
-| 🏗️ | **Reviewer** (Architect) | Deep code analysis with language-specific expertise |
-| 🔧 | **Fixer** (Engineer) | Generates precise Search/Replace fix blocks |
-| 🧪 | **Tester** (QA) | Validates fixes in Docker sandbox |
-| 🛡️ | **Critic** (Adversary) | Fast pre-screening to reject bad fixes before sandbox |
+| 🏗️ | **Reviewer** (Architect) | Pre-loads file context, single LLM call for deep review |
+| 🔧 | **Fixer** (Engineer) | Pre-loads changed files, single call for precise Search/Replace blocks |
+| 🧪 | **Tester** (QA) | Docker sandbox validation (auto-skipped in CLI mode) |
+| 🛡️ | **Critic** (Rule-based) | Pure rule checks (bracket matching, empty content), zero LLM cost |
 
 ### 🌍 9 Programming Languages
 Go · Python · C++ · Java · Vue · Node.js · TypeScript · Flutter · Unity(C#)
@@ -281,7 +281,10 @@ A: Fully. LLM gateway, Redis, Postgres can all be deployed on-premise. vLLM and 
 A: Docker sandbox uses command whitelisting (only standard test commands allowed), 300s timeout, 512MB memory limit, and network controls. No arbitrary shell execution.
 
 **Q: What's the review latency?**
-A: Webhook returns `{"status": "processing"}` immediately. Review runs asynchronously, typically 1-3 minutes depending on MR size and LLM response time.
+A: Webhook returns `{"status": "processing"}` immediately. In CLI mode, changes under 7 files typically complete in ~30 seconds (pre-loaded context + single LLM call, no ReAct tool loop). Webhook mode depends on MR size and LLM response time.
+
+**Q: Does it support Windows?**
+A: Fully. Windows-specific issues (asyncio SelectorEventLoop, GBK console encoding, signal handling) are all handled.
 
 **Q: What if a Worker crashes?**
 A: With Postgres Checkpointer enabled, graph state is auto-persisted. New Workers resume from the last checkpoint without re-consuming tokens.
