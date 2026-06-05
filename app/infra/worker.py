@@ -165,21 +165,29 @@ async def main():
     logger.info("已连接 Redis 队列: %s", settings.queue.redis_url)
 
     # 初始化 Checkpointer
-    checkpointer = get_checkpointer()
-    if checkpointer:
-        async with checkpointer as cp:
+    checkpointer_ctx = get_checkpointer()
+    checkpointer = None
+    if checkpointer_ctx:
+        async with checkpointer_ctx as cp:
             await cp.setup()
-        logger.info("Postgres Checkpointer 已就绪")
+            checkpointer = cp
+            logger.info("Postgres Checkpointer 已就绪")
 
-    # 构建 Graph（带 checkpointer）
-    graph = compile_graph(checkpointer=checkpointer)
-
-    # 运行 Worker 循环
-    try:
-        await _run_worker_loop(graph)
-    finally:
-        await review_queue.close()
-        logger.info("Worker 已关闭")
+            # 构建 Graph（带 checkpointer）并在其生命周期内运行
+            graph = compile_graph(checkpointer=checkpointer)
+            try:
+                await _run_worker_loop(graph)
+            finally:
+                await review_queue.close()
+                logger.info("Worker 已关闭")
+    else:
+        # 无 checkpointer 模式
+        graph = compile_graph()
+        try:
+            await _run_worker_loop(graph)
+        finally:
+            await review_queue.close()
+            logger.info("Worker 已关闭")
 
 
 if __name__ == "__main__":
