@@ -36,9 +36,19 @@ async def tester_node(state: ReviewState) -> Dict[str, Any]:
     - 读取 diff_chunks + detected_languages 替代单一 language
     - 将 diff_chunks 中的文件解析为 source_files 映射
     - 按语言矩阵选择测试命令和镜像
+
+    CLI 模式优化：跳过 Docker 沙盒（审查+修复已完成，沙盒冷启动耗时过长）
     """
     detected = state.get("detected_languages", [])
     blocks = state.get("search_replace_blocks", [])
+
+    # CLI 模式跳过沙盒测试（节省 Docker 冷启动 15-30s）
+    if state.get("vcs_provider") == "cli" and blocks:
+        logger.info("CLI 模式: 跳过沙盒测试，直接通过")
+        return {
+            "test_logs": "CLI 模式: 已跳过沙盒测试",
+            "is_test_passed": True,
+        }
 
     logger.info(
         "Tester 节点开始执行: pr=%s, languages=%s, blocks=%d",

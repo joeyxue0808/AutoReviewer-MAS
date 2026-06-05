@@ -123,11 +123,25 @@ def _after_reviewer(state: ReviewState) -> Literal["fixer_node", "__end__"]:
 
 
 def _after_critic(state: ReviewState) -> Literal["tester_node", "fixer_node"]:
-    """Critic 之后：通过 → tester，拒绝 → 回到 fixer。"""
+    """Critic 之后：通过 → tester，拒绝 → 回到 fixer（带重试上限）。"""
     blocks = state.get("search_replace_blocks", [])
-    if not blocks and state.get("test_logs", "").startswith("Critic 拒绝"):
-        logger.info("Critic 拒绝，回到 fixer 重试")
-        return "fixer_node"
+    retry_count = state.get("retry_count", 0)
+
+    if not blocks:
+        # 无 blocks 有两种情况：
+        # 1. Critic 拒绝了有缺陷的 blocks → 应重试
+        # 2. Fixer 因 429/错误返回空 → 不应无限重试
+        if retry_count >= settings.max_retry_count:
+            logger.warning("Critic: 无 blocks 且已达最大重试 (%d/%d)，降级提交", retry_count, settings.max_retry_count)
+            return "tester_node"
+
+        if state.get("test_logs", "").startswith("Critic 拒绝"):
+            logger.info("Critic 拒绝，回到 fixer 重试 (%d/%d)", retry_count, settings.max_retry_count)
+            return "fixer_node"
+
+        # Fixer 失败（非 Critic 拒绝），直接进入 tester 降级
+        logger.info("Critic: 无 blocks（Fixer 可能失败），进入 tester 降级")
+        return "tester_node"
 
     logger.info("Critic 通过，进入 tester")
     return "tester_node"
@@ -202,6 +216,12 @@ async def submit_node(state: ReviewState) -> Dict[str, Any]:
 
     # 如果是降级提交（达到重试上限），在报告中标注
     report = _format_review_report(state)
+
+    # CLI 模式: 不需要提交到 VCS，直接返回报告
+    if vcs_provider == "cli":
+        logger.info("CLI 模式: 跳过 VCS 提交，返回本地审查报告")
+        return {"review_report": report}
+
     provider = _create_vcs_provider(vcs_provider)
 
     try:

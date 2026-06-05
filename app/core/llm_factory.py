@@ -164,13 +164,6 @@ class RetryableChatModel(BaseChatModel):
     ) -> Any:
         @self._retry_decorator
         async def _inner_agenerate() -> Any:
-            # 熔断器保护：连续失败 N 次后触发熔断
-            if settings.circuit_breaker.enabled:
-                return await llm_breaker.call_async(
-                    self._inner._agenerate(
-                        messages, stop=stop, run_manager=run_manager, **kwargs
-                    )
-                )
             return await self._inner._agenerate(
                 messages, stop=stop, run_manager=run_manager, **kwargs
             )
@@ -204,6 +197,10 @@ _ROLE_PARAMS: dict[str, dict[str, Any]] = {
 }
 
 
+# LLM 实例缓存（按 role 缓存，避免重复创建）
+_LLM_CACHE: Dict[str, RetryableChatModel] = {}
+
+
 def get_llm(role: str, trace_id: Optional[str] = None) -> RetryableChatModel:
     """根据角色获取对应的 LLM 实例，注入角色专属参数。
 
@@ -230,6 +227,10 @@ def get_llm(role: str, trace_id: Optional[str] = None) -> RetryableChatModel:
         raise ValueError(
             f"未知的 LLM 角色: '{role}'。可用角色: {list(settings.llm.roles.keys())}"
         )
+
+    # 缓存命中：同一 role 复用同一 LLM 实例（配置不变则实例不变）
+    if role in _LLM_CACHE:
+        return _LLM_CACHE[role]
 
     role_config = settings.llm.roles[role]
 
@@ -259,5 +260,7 @@ def get_llm(role: str, trace_id: Optional[str] = None) -> RetryableChatModel:
         role_params.get("top_p", 1.0),
     )
 
-    # 包装带重试机制的模型
-    return RetryableChatModel(inner=chat_model)
+    # 包装带重试机制的模型并缓存
+    instance = RetryableChatModel(inner=chat_model)
+    _LLM_CACHE[role] = instance
+    return instance
