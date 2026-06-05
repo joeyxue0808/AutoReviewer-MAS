@@ -31,3 +31,6 @@ Thumbs.db
 
 # Logs
 *.log
+config/settings.yaml
+.claude/settings.json
+
