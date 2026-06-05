@@ -145,7 +145,6 @@ class GitHubProvider(BaseVCSProvider):
                         raise RuntimeError(f"发表评论失败: status={resp.status}, body={text}")
 
             await self._with_breaker(_post())
-                    logger.error("发表评论失败: status=%d, body=%s", resp.status, text)
 
         logger.info("已向 PR #%s (repo %s) 发表 %d 条评论", pr_id, repo_id, len(comments))
 
