@@ -157,20 +157,29 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
     # DiffAnalyzer 检测语言和拆分
     analyzer = DiffAnalyzer()
     detected = analyzer.detect_languages(diff_text)
-    diff_chunks = analyzer.chunk_diff(diff_text)
+    chunk_list = analyzer.chunk_diff(diff_text)
 
     if not detected:
         console.print("[yellow]⚠️  无法识别编程语言，使用默认审查[/yellow]")
         detected = ["unknown"]
 
     console.print(f"[cyan]🔍 检测到语言: {', '.join(detected)}[/cyan]")
+    console.print(f"[cyan]📦 切分为 {len(chunk_list)} 个 Chunk (防上下文爆炸)[/cyan]")
+
+    # 转换为 ReviewState 需要的 Dict[str, str] 格式
+    diff_chunks = {c.chunk_id: c.content for c in chunk_list}
+
+    # 生成 Repo-Map 全局上下文 (Implementation Guide Phase 5 Task 5.1)
+    from app.core.repo_mapper import generate_repo_map
+    repo_context = generate_repo_map(repo_root)
+    console.print(f"[cyan]🗺️  Repo-Map 已生成 ({len(repo_context)} chars)[/cyan]")
 
     # 构建初始状态
     initial_state: ReviewState = {
         "vcs_provider": "cli",
         "pr_id": f"local-{branch}",
         "trigger_type": "cli",
-        "repo_context": f"本地仓库: {repo_root}, 分支: {branch}",
+        "repo_context": repo_context,
         "diff_chunks": diff_chunks,
         "detected_languages": detected,
         "review_issues": [],
@@ -247,8 +256,8 @@ def _display_results(state: dict) -> None:
         console.print(f"[cyan]📝 生成 {len(blocks)} 个修复块:[/cyan]")
         for i, block in enumerate(blocks, 1):
             fp = block.get("file_path", "")
-            search = block.get("search", "")[:100]
-            replace = block.get("replace", "")[:100]
+            search = block.get("search_block", block.get("search", ""))[:100]
+            replace = block.get("replace_block", block.get("replace", ""))[:100]
             console.print(f"  {i}. [cyan]{fp}[/cyan]")
             console.print(f"     [red]- {search!r}...[/red]")
             console.print(f"     [green]+ {replace!r}...[/green]")

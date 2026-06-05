@@ -51,8 +51,13 @@ async def _enqueue_review_task(
         logger.info("正在获取 %s %s!%s 的 diff...", vcs_provider, repo_id, pr_id)
         diff_result: DiffResult = await provider.get_diff(repo_id, pr_id)
 
-        # 获取 Repo Map
-        repo_map = await provider.get_repo_map(repo_id)
+        # 获取 Repo Map（VCS API 优先，失败则降级为本地目录树）
+        try:
+            repo_map = await provider.get_repo_map(repo_id)
+        except Exception as e:
+            logger.warning("VCS Repo-Map 获取失败，降级为本地目录树: %s", e)
+            from app.core.repo_mapper import generate_repo_map
+            repo_map = generate_repo_map(".")
 
         # 按语言拆分 diff_chunks
         diff_chunks: Dict[str, str] = {}

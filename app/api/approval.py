@@ -1,12 +1,13 @@
-"""审批 API - Phase 4 Human-in-the-Loop。
+"""审批 API - Human-in-the-Loop (Implementation Guide Phase 3 Task 3.3)。
 
 提供审批端点，Tech Lead 点击"允许提交"后调用，
 唤醒挂起的 Graph 完成 GitLab/GitHub 提交。
 
-端点：
-- POST /api/v1/approve/{thread_id} — 批准提交
-- POST /api/v1/reject/{thread_id} — 拒绝提交
-- GET /api/v1/approval/pending — 查询待审批列表
+核心机制：
+- Graph 编译时配置 `interrupt_before=["submit_node"]`
+- Graph 执行到 submit_node 前自动挂起，状态持久化到 Postgres
+- Tech Lead 调用 `/api/v1/approve/{thread_id}` 后，
+  执行 `graph.update_state(thread_id, {"approval": True})` 恢复图流转
 """
 
 import logging
@@ -44,26 +45,28 @@ def register_pending_approval(
 
 @router.post("/approve/{thread_id}")
 async def approve(thread_id: str) -> Dict[str, str]:
-    """批准提交，唤醒挂起的 Graph。
+    """批准提交，通过 update_state 唤醒挂起的 Graph。
 
-    Tech Lead 在飞书/钉钉卡片中点击"允许提交"后调用此端点。
+    实现机制（Implementation Guide Phase 3 Task 3.3）：
+    1. 获取 checkpointer 和编译后的 graph
+    2. 调用 graph.update_state() 注入 {"approval": True}
+    3. 调用 graph.ainvoke(None) 恢复执行
     """
     if thread_id not in _pending_approvals:
         raise HTTPException(status_code=404, detail=f"未找到待审批任务: {thread_id}")
 
     logger.info("收到批准: thread=%s", thread_id)
 
-    # 获取 checkpointer 并恢复 Graph
     checkpointer = get_checkpointer()
     if not checkpointer:
         raise HTTPException(status_code=500, detail="Checkpointer 未启用，无法恢复 Graph")
 
     graph = compile_graph(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        # 唤醒 Graph：从 submit_node 继续执行
-        config = {"configurable": {"thread_id": thread_id}}
-        # graph.update_state 不传新数据，仅标记为继续
+        # 注入审批标记并恢复图流转
+        graph.update_state(config, {"approval": True})
         await graph.ainvoke(None, config=config)
 
         _pending_approvals[thread_id]["status"] = "approved"
@@ -86,7 +89,6 @@ async def reject(thread_id: str) -> Dict[str, str]:
 
     _pending_approvals[thread_id]["status"] = "rejected"
 
-    # 向 VCS 发送拒绝评论
     info = _pending_approvals[thread_id]
     try:
         from app.vcs.gitlab_client import GitLabProvider
