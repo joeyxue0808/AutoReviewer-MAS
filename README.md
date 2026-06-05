@@ -66,11 +66,13 @@ High-risk operations (DB migrations, auth changes, CI configs) automatically pau
 - **Postgres Checkpointer** for crash recovery (resume from last checkpoint)
 - **pybreaker** circuit breaker for LLM/VCS API protection
 
-### 🔍 MCP Tool Chain
+### 🔍 MCP Tool Chain (Pure Python, No Vector DB)
 Agents can actively explore the codebase (not just passively read diffs):
-- Read file context at specific line ranges
-- Search symbol references across the entire repo
-- Explore directory structures
+- **read_file_context**: Read file content at specific line ranges (Pydantic schema constrained)
+- **ast_find_references**: Search symbol references across the entire repo (tree-sitter / regex fallback)
+- **list_directory**: Explore directory structures with depth control
+
+All tools are **read-only** Python functions — no vector database, no embedding model, no RAG retrieval.
 
 ---
 
