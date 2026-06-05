@@ -39,10 +39,11 @@ class LLMRoleConfig(BaseModel):
 
     @property
     def api_key(self) -> str:
-        """从环境变量读取 API Key。"""
+        """读取 API Key：优先环境变量，回退为直接值。"""
         key = os.getenv(self.api_key_env, "")
         if not key:
-            raise ValueError(f"环境变量 {self.api_key_env} 未设置")
+            # 环境变量不存在时，将 api_key_env 视为直接值（兼容 YAML 内嵌密钥）
+            key = self.api_key_env
         return key
 
 
@@ -78,10 +79,10 @@ class GitLabConfig(BaseModel):
 
     @property
     def token(self) -> str:
-        """从环境变量读取 GitLab Token。"""
+        """读取 GitLab Token：优先环境变量，回退为直接值。"""
         token = os.getenv(self.token_env, "")
         if not token:
-            raise ValueError(f"环境变量 {self.token_env} 未设置")
+            token = self.token_env
         return token
 
 
@@ -93,10 +94,10 @@ class GitHubConfig(BaseModel):
 
     @property
     def token(self) -> str:
-        """从环境变量读取 GitHub Token。"""
+        """读取 GitHub Token：优先环境变量，回退为直接值。"""
         token = os.getenv(self.token_env, "")
         if not token:
-            raise ValueError(f"环境变量 {self.token_env} 未设置")
+            token = self.token_env
         return token
 
 

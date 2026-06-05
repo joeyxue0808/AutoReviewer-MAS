@@ -29,7 +29,7 @@ TOOLS = [read_file_context, ast_find_references, list_directory]
 TOOL_MAP = {t.name: t for t in TOOLS}
 
 # ReAct 循环最大迭代次数（防止无限循环）
-MAX_TOOL_ITERATIONS = 5
+MAX_TOOL_ITERATIONS = 8
 
 
 async def reviewer_node(state: ReviewState) -> Dict[str, Any]:

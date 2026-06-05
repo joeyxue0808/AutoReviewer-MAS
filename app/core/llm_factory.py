@@ -134,6 +134,14 @@ class RetryableChatModel(BaseChatModel):
     def _llm_type(self) -> str:
         return "retryable-chat-openai"
 
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+        """代理 bind_tools 到内部 ChatOpenAI 实例。"""
+        return self._inner.bind_tools(tools, **kwargs)
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
+        """代理 with_structured_output 到内部 ChatOpenAI 实例。"""
+        return self._inner.with_structured_output(schema, **kwargs)
+
     def _generate(
         self,
         messages: List[BaseMessage],
