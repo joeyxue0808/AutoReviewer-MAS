@@ -1,11 +1,13 @@
-"""LLM 工厂模块 - 严格遵循 Blueprint 规范。
+"""LLM 工厂模块。
 
 提供 get_llm(role: str) 函数，根据角色返回对应的 LangChain ChatOpenAI 实例。
 支持 Mimo 网关和 vLLM（均兼容 OpenAI API）。
 集成 tenacity 库实现指数退避重试机制。
+集成 Langfuse 全链路监控与 Token 记账 (Implementation Guide Phase 5 Task 5.2)。
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Union
 
 from langchain_core.language_models import BaseChatModel
@@ -22,6 +24,73 @@ from app.core.config import settings
 from app.infra.circuit_breaker import llm_breaker
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+# Langfuse 监控（可选依赖，优雅降级）
+# ─────────────────────────────────────────────
+
+_LANGFUSE_AVAILABLE = False
+_langfuse_handler = None
+
+
+def _init_langfuse():
+    """初始化 Langfuse CallbackHandler（如果可用）。"""
+    global _LANGFUSE_AVAILABLE, _langfuse_handler
+
+    langfuse_secret = os.getenv("LANGFUSE_SECRET_KEY")
+    langfuse_public = os.getenv("LANGFUSE_PUBLIC_KEY")
+
+    if not langfuse_secret or not langfuse_public:
+        logger.debug("Langfuse 未配置 (LANGFUSE_SECRET_KEY/LANGFUSE_PUBLIC_KEY)，跳过监控")
+        return
+
+    try:
+        from langfuse.callback import CallbackHandler
+        _langfuse_handler = CallbackHandler(
+            secret_key=langfuse_secret,
+            public_key=langfuse_public,
+            host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+        )
+        _LANGFUSE_AVAILABLE = True
+        logger.info("Langfuse 监控已启用")
+    except ImportError:
+        logger.debug("langfuse 未安装，跳过监控。安装: pip install langfuse")
+    except Exception as e:
+        logger.warning("Langfuse 初始化失败: %s", e)
+
+
+# 模块加载时尝试初始化
+_init_langfuse()
+
+
+def get_langfuse_callbacks(trace_id: Optional[str] = None) -> list:
+    """获取 Langfuse 回调列表。
+
+    Args:
+        trace_id: 可选的 trace ID（如 mr_id），用于关联整个 Graph 执行
+
+    Returns:
+        回调列表（空列表表示未启用）
+    """
+    if not _LANGFUSE_AVAILABLE or not _langfuse_handler:
+        return []
+
+    if trace_id:
+        # 为每次调用创建新的 handler 实例，关联到同一 trace
+        try:
+            from langfuse.callback import CallbackHandler
+            return [CallbackHandler(
+                secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+                public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+                host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+                trace_id=trace_id,
+                metadata={"trace_id": trace_id},
+            )]
+        except Exception:
+            return [_langfuse_handler]
+
+    return [_langfuse_handler]
 
 
 class RetryableChatModel(BaseChatModel):
@@ -105,11 +174,43 @@ class RetryableChatModel(BaseChatModel):
         return self._inner._identifying_params
 
 
-def get_llm(role: str) -> RetryableChatModel:
-    """根据角色获取对应的 LLM 实例。
+# ─────────────────────────────────────────────
+# 角色参数映射表 (Implementation Guide Phase 2 Task 2.2)
+# ─────────────────────────────────────────────
+
+# reviewer: 发散思维找 Bug，允许较高随机性
+# fixer/tester: 强制消除随机性，保证代码与 JSON 严格收敛
+_ROLE_PARAMS: dict[str, dict[str, Any]] = {
+    "reviewer": {
+        "temperature": 0.3,
+        "top_p": 0.9,
+    },
+    "fixer": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+    },
+    "tester": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+    },
+}
+
+
+def get_llm(role: str, trace_id: Optional[str] = None) -> RetryableChatModel:
+    """根据角色获取对应的 LLM 实例，注入角色专属参数。
+
+    参数策略（Implementation Guide Phase 2 Task 2.2）：
+    - reviewer: temperature=0.3, top_p=0.9（发散思维找 Bug）
+    - fixer:    temperature=0.0, top_p=1.0（严格收敛，消除随机性）
+    - tester:   temperature=0.0, top_p=1.0（严格收敛，消除随机性）
+
+    监控（Implementation Guide Phase 5 Task 5.2）：
+    - 如果配置了 Langfuse 环境变量，自动注入 CallbackHandler
+    - trace_id 关联整个 Graph 执行的 LLM 调用
 
     Args:
         role: LLM 角色名称 (reviewer, fixer, tester)
+        trace_id: 可选的 trace ID（如 mr_id），用于 Langfuse 监控关联
 
     Returns:
         RetryableChatModel: 带重试机制的 ChatOpenAI 包装实例
@@ -124,21 +225,30 @@ def get_llm(role: str) -> RetryableChatModel:
 
     role_config = settings.llm.roles[role]
 
+    # 获取角色专属参数（覆盖配置文件中的默认值）
+    role_params = _ROLE_PARAMS.get(role, {})
+
+    # Langfuse 回调（Implementation Guide Phase 5 Task 5.2）
+    callbacks = get_langfuse_callbacks(trace_id)
+
     # 创建 ChatOpenAI 实例
     # 兼容 Mimo 网关和 vLLM（均提供 OpenAI 兼容 API）
     chat_model = ChatOpenAI(
         base_url=role_config.base_url,
         model=role_config.model,
         api_key=role_config.api_key,
-        temperature=role_config.temperature,
+        temperature=role_params.get("temperature", role_config.temperature),
+        top_p=role_params.get("top_p", 1.0),
         max_tokens=role_config.max_tokens,
+        callbacks=callbacks if callbacks else None,
     )
 
     logger.info(
-        "已创建 LLM 实例: role=%s, model=%s, base_url=%s",
+        "已创建 LLM 实例: role=%s, model=%s, temp=%.1f, top_p=%.1f",
         role,
         role_config.model,
-        role_config.base_url,
+        role_params.get("temperature", role_config.temperature),
+        role_params.get("top_p", 1.0),
     )
 
     # 包装带重试机制的模型

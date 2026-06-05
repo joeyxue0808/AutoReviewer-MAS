@@ -1,12 +1,15 @@
-"""BaseVCSProvider 抽象类 - Blueprint V2.0 VCS 多态抽象。
+"""BaseVCSProvider 抽象类 - VCS 多态抽象。
 
 统一 GitLab / GitHub / CLI 的接口契约。
 所有 VCS 客户端必须实现此抽象类。
+VCS API 调用通过 vcs_breaker 熔断器保护（Implementation Guide Phase 3 Task 3.1）。
 """
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+from app.infra.circuit_breaker import vcs_breaker
 
 
 @dataclass
@@ -110,3 +113,20 @@ class BaseVCSProvider(abc.ABC):
     async def close(self) -> None:
         """清理 HTTP 会话等资源。"""
         ...
+
+    async def _with_breaker(self, coro):
+        """用 VCS 熔断器包装异步调用。
+
+        连续失败 5 次后触发熔断，快速返回失败，
+        休眠 60 秒后进入半开状态。
+
+        Args:
+            coro: 异步协程
+
+        Returns:
+            协程返回值
+
+        Raises:
+            pybreaker.CircuitBreakerError: 熔断器处于 Open 状态
+        """
+        return await vcs_breaker.call_async(coro)

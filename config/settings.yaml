@@ -112,11 +112,11 @@ checkpointer:
   enabled: true
   postgres_url: "postgresql://postgres:postgres@localhost:5432/autoreviewer"
 
-# Phase 1: API 熔断器配置 (pybreaker)
+# Circuit Breaker (pybreaker)
 circuit_breaker:
   enabled: true
-  fail_max: 5        # 60 秒内连续失败 N 次触发熔断
-  reset_timeout: 30  # 熔断后等待 N 秒进入半开状态
+  fail_max: 5        # 连续失败 5 次触发熔断 (Circuit Open)
+  reset_timeout: 60  # 熔断后休眠 60 秒进入半开状态 (Half-Open)
   exclude_exceptions:  # 这些异常不计入熔断计数
     - "ValueError"
     - "KeyError"

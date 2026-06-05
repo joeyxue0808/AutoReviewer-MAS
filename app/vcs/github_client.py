@@ -68,18 +68,22 @@ class GitHubProvider(BaseVCSProvider):
         """获取 GitHub PR 的文件变更。"""
         # 获取 PR 文件列表
         url = f"{self._base_url}/repos/{repo_id}/pulls/{pr_id}/files"
+        diff_url = f"{self._base_url}/repos/{repo_id}/pulls/{pr_id}"
         session = await self._get_session()
 
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"获取 PR 文件失败: status={resp.status}, body={text}")
-            files_data: list[dict] = await resp.json()
+        async def _fetch_files():
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"获取 PR 文件失败: status={resp.status}, body={text}")
+                return await resp.json()
 
-        # 获取原始 diff（通过 Accept header）
-        diff_url = f"{self._base_url}/repos/{repo_id}/pulls/{pr_id}"
-        async with session.get(diff_url, headers={**self._headers, "Accept": "application/vnd.github.v3.diff"}) as diff_resp:
-            raw_diff = await diff_resp.text() if diff_resp.status == 200 else ""
+        async def _fetch_diff():
+            async with session.get(diff_url, headers={**self._headers, "Accept": "application/vnd.github.v3.diff"}) as resp:
+                return await resp.text() if resp.status == 200 else ""
+
+        files_data: list[dict] = await self._with_breaker(_fetch_files())
+        raw_diff = await self._with_breaker(_fetch_diff())
 
         files: List[Dict[str, Any]] = []
         languages: set[str] = set()
@@ -114,15 +118,15 @@ class GitHubProvider(BaseVCSProvider):
         pr_id: str,
         comments: List[CommentPayload],
     ) -> None:
-        """向 GitHub PR 发表评论。"""
+        """向 GitHub PR 发表评论（熔断器保护）。"""
         session = await self._get_session()
 
-        # 需要获取 PR 的 commit SHA 用于行内评论
-        head_sha = await self._get_pr_head_sha(repo_id, pr_id, session)
+        head_sha = await self._with_breaker(
+            self._get_pr_head_sha(repo_id, pr_id, session)
+        )
 
         for comment in comments:
             if comment.file_path and comment.line_number and head_sha:
-                # 行内评论 → Pull Request Reviews API
                 url = f"{self._base_url}/repos/{repo_id}/pulls/{pr_id}/comments"
                 payload = {
                     "body": comment.body,
@@ -131,13 +135,16 @@ class GitHubProvider(BaseVCSProvider):
                     "line": comment.line_number,
                 }
             else:
-                # 普通评论 → Issues API（PR 也是 Issue）
                 url = f"{self._base_url}/repos/{repo_id}/issues/{pr_id}/comments"
                 payload = {"body": comment.body}
 
-            async with session.post(url, json=payload) as resp:
-                if resp.status not in (200, 201):
-                    text = await resp.text()
+            async def _post(u=url, p=payload):
+                async with session.post(u, json=p) as resp:
+                    if resp.status not in (200, 201):
+                        text = await resp.text()
+                        raise RuntimeError(f"发表评论失败: status={resp.status}, body={text}")
+
+            await self._with_breaker(_post())
                     logger.error("发表评论失败: status=%d, body=%s", resp.status, text)
 
         logger.info("已向 PR #%s (repo %s) 发表 %d 条评论", pr_id, repo_id, len(comments))

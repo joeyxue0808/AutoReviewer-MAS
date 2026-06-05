@@ -55,6 +55,47 @@ class BaseSandboxEngine(abc.ABC):
         """清理沙盒资源（容器、临时文件等）。"""
         ...
 
+    async def run_by_language(
+        self,
+        language: str,
+        source_files: Dict[str, str],
+        search_replace_blocks: Optional[List[Dict[str, Any]]] = None,
+        timeout: int = 300,
+    ) -> SandboxResult:
+        """通过语言枚举执行测试（Implementation Guide Phase 4 Task 4.2）。
+
+        TesterNode 只传 language 枚举，沙盒内部查询 language_matrix 白名单，
+        禁止外部传递任意 Shell 命令。
+
+        Args:
+            language: 语言 key（如 "go", "python"），必须在 language_matrix 中定义
+            source_files: 源文件映射
+            search_replace_blocks: 搜索/替换块
+            timeout: 超时秒数
+
+        Returns:
+            SandboxResult
+        """
+        from app.core.language_matrix import get_config
+
+        try:
+            lang_config = get_config(language)
+        except KeyError:
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr=f"Unsupported language: {language}",
+                timed_out=False,
+            )
+
+        return await self.run(
+            image=lang_config.image,
+            command=lang_config.test_command,
+            source_files=source_files,
+            search_replace_blocks=search_replace_blocks,
+            timeout=timeout,
+        )
+
     @staticmethod
     def apply_search_replace(
         source_files: Dict[str, str],
@@ -79,8 +120,8 @@ class BaseSandboxEngine(abc.ABC):
 
         for block in blocks:
             file_path = block.get("file_path", "")
-            search = block.get("search", "")
-            replace = block.get("replace", "")
+            search = block.get("search_block", block.get("search", ""))
+            replace = block.get("replace_block", block.get("replace", ""))
 
             if not file_path or not search:
                 logger.warning("跳过无效 block: file_path=%s", file_path)

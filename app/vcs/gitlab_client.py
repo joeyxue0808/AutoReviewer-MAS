@@ -65,15 +65,18 @@ class GitLabProvider(BaseVCSProvider):
     # ─────────────────────────────────────────
 
     async def get_diff(self, repo_id: str, pr_id: str) -> DiffResult:
-        """获取 GitLab MR 的文件变更。"""
+        """获取 GitLab MR 的文件变更（熔断器保护）。"""
         url = f"{self._base_url}/projects/{repo_id}/merge_requests/{pr_id}/changes"
         session = await self._get_session()
 
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"获取 MR 变更失败: status={resp.status}, body={text}")
-            data = await resp.json()
+        async def _fetch():
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"获取 MR 变更失败: status={resp.status}, body={text}")
+                return await resp.json()
+
+        data = await self._with_breaker(_fetch())
 
         changes = data.get("changes", [])
         files: List[Dict[str, Any]] = []
@@ -113,12 +116,11 @@ class GitLabProvider(BaseVCSProvider):
         pr_id: str,
         comments: List[CommentPayload],
     ) -> None:
-        """向 GitLab MR 发表评论。"""
+        """向 GitLab MR 发表评论（熔断器保护）。"""
         session = await self._get_session()
 
         for comment in comments:
             if comment.file_path and comment.line_number:
-                # 行内评论 → 使用 Discussion API
                 url = f"{self._base_url}/projects/{repo_id}/merge_requests/{pr_id}/discussions"
                 payload = {
                     "body": comment.body,
@@ -132,14 +134,16 @@ class GitLabProvider(BaseVCSProvider):
                     },
                 }
             else:
-                # 普通评论 → Notes API
                 url = f"{self._base_url}/projects/{repo_id}/merge_requests/{pr_id}/notes"
                 payload = {"body": comment.body}
 
-            async with session.post(url, json=payload) as resp:
-                if resp.status not in (200, 201):
-                    text = await resp.text()
-                    logger.error("发表评论失败: status=%d, body=%s", resp.status, text)
+            async def _post(u=url, p=payload):
+                async with session.post(u, json=p) as resp:
+                    if resp.status not in (200, 201):
+                        text = await resp.text()
+                        raise RuntimeError(f"发表评论失败: status={resp.status}, body={text}")
+
+            await self._with_breaker(_post())
 
         logger.info("已向 MR !%s (项目 %s) 发表 %d 条评论", pr_id, repo_id, len(comments))
 
