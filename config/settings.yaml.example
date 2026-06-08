@@ -98,6 +98,14 @@ github:
 #   gitlab_secret: "your-gitlab-webhook-token"
 #   github_secret: "your-github-webhook-secret"
 
+# 审批通知（HITL）
+# APPROVAL_WEBHOOK_URL: 飞书/钉钉 Webhook（自动识别渠道类型）
+# WECOM_WEBHOOK_URL: 企业微信 Webhook
+# 可同时配置，通知会发送到所有已配置的渠道
+# approval:
+#   webhook_url: ""  # 或通过环境变量 APPROVAL_WEBHOOK_URL
+#   wecom_url: ""    # 或通过环境变量 WECOM_WEBHOOK_URL
+
 max_retry_count: 3
 
 # 消息队列 (Redis Streams)

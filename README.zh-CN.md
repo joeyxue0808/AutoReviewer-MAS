@@ -117,8 +117,11 @@ $env:GITHUB_TOKEN = "你的GitHub Token"
 | `GITHUB_TOKEN` | GitHub 模式 | GitHub API Token |
 | `GITHUB_WEBHOOK_SECRET` | 推荐 | GitHub Webhook HMAC 签名密钥 |
 | `GITLAB_WEBHOOK_SECRET` | 推荐 | GitLab Webhook Token |
-| `APPROVAL_WEBHOOK_URL` | 可选 | 飞书/钉钉审批通知 Webhook |
+| `APPROVAL_WEBHOOK_URL` | 可选 | 飞书/钉钉审批通知 Webhook（自动识别渠道类型） |
+| `WECOM_WEBHOOK_URL` | 可选 | 企业微信审批通知 Webhook |
 | `LANGFUSE_SECRET_KEY` | 可选 | Langfuse 监控密钥 |
+
+> 💡 `APPROVAL_WEBHOOK_URL` 和 `WECOM_WEBHOOK_URL` 可同时配置，通知会发送到所有已配置的渠道。
 
 ### 使用方式
 

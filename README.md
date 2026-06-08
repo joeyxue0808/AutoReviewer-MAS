@@ -111,8 +111,12 @@ EOF
 | `GITHUB_TOKEN` | For GitHub | GitHub API token |
 | `GITHUB_WEBHOOK_SECRET` | Recommended | GitHub webhook HMAC secret |
 | `GITLAB_WEBHOOK_SECRET` | Recommended | GitLab webhook token |
-| `APPROVAL_WEBHOOK_URL` | Optional | Feishu/DingTalk approval webhook |
+| `APPROVAL_WEBHOOK_URL` | Optional | Feishu/DingTalk approval webhook (auto-detects channel) |
+| `WECOM_WEBHOOK_URL` | Optional | WeCom (企业微信) approval webhook |
 | `LANGFUSE_SECRET_KEY` | Optional | Langfuse monitoring |
+
+> 💡 `APPROVAL_WEBHOOK_URL` and `WECOM_WEBHOOK_URL` can be set simultaneously —
+> notifications will be sent to all configured channels.
 
 ### Usage
 
