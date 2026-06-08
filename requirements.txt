@@ -21,8 +21,7 @@ tenacity>=9.0
 # Docker sandbox
 docker>=7.0
 
-# VCS clients
-python-gitlab>=4.0
+# VCS clients (using raw aiohttp, not python-gitlab SDK)
 aiohttp>=3.10
 
 # Phase 1: Message queue (Redis Streams)

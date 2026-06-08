@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Set
 
-from app.core.language_matrix import LANGUAGE_MATRIX, get_lang_by_suffix
+from app.core.language_matrix import get_lang_by_suffix, get_config
 
 logger = logging.getLogger(__name__)
 

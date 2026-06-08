@@ -22,7 +22,6 @@ from langgraph.graph import END, StateGraph
 from app.agents.nodes.critic import critic_node
 from app.agents.nodes.fixer import fixer_node
 from app.agents.nodes.reviewer import reviewer_node
-from app.agents.nodes.synthesizer import synthesize_results
 from app.agents.nodes.tester import tester_node
 from app.core.config import settings
 from app.core.diff_analyzer import DiffAnalyzer, DiffChunk
@@ -177,23 +176,6 @@ def _after_tester(state: ReviewState) -> Literal["fixer_node", "submit_node"]:
 
     logger.info("测试未通过，重试 (%d/%d): 回到 fixer 节点", retry_count, max_retries)
     return "fixer_node"
-
-
-# ─────────────────────────────────────────────
-# 合并节点：汇总并发结果
-# ─────────────────────────────────────────────
-
-
-async def merge_node(state: ReviewState) -> Dict[str, Any]:
-    """汇总并发 reviewer 的结果。
-
-    当 Send API 并发多个 reviewer_node 时，
-    LangGraph 会自动收集结果到 state 中。
-    此节点用于记录汇总日志。
-    """
-    issues = state.get("review_issues", [])
-    logger.info("Merge: 汇总 %d 个 review_issues", len(issues))
-    return {}
 
 
 # ─────────────────────────────────────────────
