@@ -25,7 +25,8 @@ llm:
       max_tokens: 2048
 
   retry:
-    max_attempts: 5
+    max_attempts: 5           # 最大重试次数
+    # 以下参数由自适应退避策略覆盖（429 限流自动延长等待）
     min_wait_seconds: 2
     max_wait_seconds: 10
     multiplier: 1

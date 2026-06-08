@@ -15,9 +15,13 @@
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Literal
 
 from langgraph.graph import END, StateGraph
+
+# 预切分 chunk_id 格式检测："{lang}_{idx}"，如 "python_0", "go_3"
+_PRE_CHUNKED_RE = re.compile(r"^[a-z]+_\d+$")
 
 from app.agents.nodes.critic import critic_node
 from app.agents.nodes.error_recovery import error_recovery_node
@@ -45,6 +49,7 @@ def router_node(state: ReviewState) -> List[Dict[str, Any]]:
     根据 diff_chunks 的大小决定：
     - 大 MR：切分为多个 DiffChunk，通过 Send 并发分发给多个 reviewer_node
     - 小 MR：直接发送给单个 reviewer_node
+    - 已预切分（CLI 传入的 chunk_id 格式如 "python_0"）：跳过重复切分
 
     Returns:
         Send 指令列表，每个元素是要发送给 reviewer_node 的状态片段
@@ -54,12 +59,21 @@ def router_node(state: ReviewState) -> List[Dict[str, Any]]:
     diff_chunks = state.get("diff_chunks", {})
     detected = state.get("detected_languages", [])
 
-    # 将 diff_chunks 合并为完整 diff 文本用于重新切片
-    full_diff = "\n".join(diff_chunks.values()) if diff_chunks else ""
-
-    if not full_diff:
-        # 无 diff 内容，直接发送空状态
+    if not diff_chunks:
         return [Send("reviewer_node", _make_sub_state(state, "__empty__", "", detected))]
+
+    # 检查是否已预切分（chunk_id 格式为 "{lang}_{idx}"，如 "python_0"）
+    if all(_PRE_CHUNKED_RE.match(k) for k in diff_chunks.keys()):
+        # 已预切分，直接按 chunk 分发，不重复切分
+        logger.info("Router: 检测到预切分 %d 个 Chunk，跳过重复切分", len(diff_chunks))
+        sends = []
+        for chunk_id, content in diff_chunks.items():
+            lang = chunk_id.rsplit("_", 1)[0]
+            sends.append(Send("reviewer_node", _make_sub_state(state, chunk_id, content, [lang])))
+        return sends
+
+    # 未预切分，合并后重新切分
+    full_diff = "\n".join(diff_chunks.values())
 
     # 使用 DiffAnalyzer 按 token 上限切片
     chunks = _analyzer.chunk_diff(full_diff)

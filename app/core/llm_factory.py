@@ -6,8 +6,10 @@
 集成 Langfuse 全链路监控与 Token 记账 (Implementation Guide Phase 5 Task 5.2)。
 """
 
+import asyncio
 import logging
 import os
+import random
 from typing import Any, Dict, List, Optional, Union
 
 from langchain_core.language_models import BaseChatModel
@@ -19,6 +21,9 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+
+# 并发信号量：限制同时进行的 LLM 请求数，防止触发网关限流
+_LLM_SEMAPHORE = asyncio.Semaphore(8)
 
 from app.core.config import settings
 from app.infra.circuit_breaker import llm_breaker
@@ -111,11 +116,7 @@ class RetryableChatModel(BaseChatModel):
             "_retry_decorator",
             retry(
                 stop=stop_after_attempt(retry_config.max_attempts),
-                wait=wait_exponential(
-                    multiplier=retry_config.multiplier,
-                    min=retry_config.min_wait_seconds,
-                    max=retry_config.max_wait_seconds,
-                ),
+                wait=self._adaptive_wait,
                 reraise=True,
                 before_sleep=self._log_retry,
             ),
@@ -124,11 +125,36 @@ class RetryableChatModel(BaseChatModel):
     @staticmethod
     def _log_retry(retry_state: RetryCallState) -> None:
         """重试前记录日志。"""
-        logger.warning(
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        exc_str = str(exc) if exc else "未知错误"
+        # 429 错误降低日志级别（高频且预期）
+        is_429 = exc and "429" in exc_str
+        log_fn = logger.info if is_429 else logger.warning
+        log_fn(
             "LLM 调用失败，正在重试 (第 %d 次): %s",
             retry_state.attempt_number,
-            retry_state.outcome.exception() if retry_state.outcome else "未知错误",
+            exc_str[:200],
         )
+
+    @staticmethod
+    def _adaptive_wait(retry_state: RetryCallState) -> float:
+        """自适应退避策略：429 用更长等待 + jitter。"""
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        attempt = retry_state.attempt_number
+        is_429 = exc and "429" in str(exc)
+
+        if is_429:
+            # 429 限流：指数退避 4/8/16/32 秒 + 随机 jitter
+            base = min(4 * (2 ** (attempt - 1)), 60)
+            jitter = random.uniform(0, base * 0.5)
+        else:
+            # 其他错误：指数退避 2/4/8/16 秒 + jitter
+            base = min(2 * (2 ** (attempt - 1)), 30)
+            jitter = random.uniform(0, base * 0.3)
+
+        wait = base + jitter
+        logger.info("退避等待 %.1f 秒 (attempt=%d, is_429=%s)", wait, attempt, is_429)
+        return wait
 
     @property
     def _llm_type(self) -> str:
@@ -164,9 +190,10 @@ class RetryableChatModel(BaseChatModel):
     ) -> Any:
         @self._retry_decorator
         async def _inner_agenerate() -> Any:
-            return await self._inner._agenerate(
-                messages, stop=stop, run_manager=run_manager, **kwargs
-            )
+            async with _LLM_SEMAPHORE:
+                return await self._inner._agenerate(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
 
         return await _inner_agenerate()
 
