@@ -7,5 +7,9 @@
 from app.tools.read_file_context import read_file_context
 from app.tools.ast_find_references import ast_find_references
 from app.tools.list_directory import list_directory
+from app.tools.semantic_code_search import semantic_code_search
 
-__all__ = ["read_file_context", "ast_find_references", "list_directory"]
+__all__ = [
+    "read_file_context", "ast_find_references", "list_directory",
+    "semantic_code_search",
+]
