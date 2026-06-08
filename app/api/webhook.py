@@ -1,22 +1,21 @@
-"""FastAPI Webhook 接口 - Phase 1 消息队列削峰重构。
+"""FastAPI Webhook 接口 - 消息队列削峰重构。
 
-废弃 BackgroundTasks，改为：
-1. 接收 Webhook → 验证签名 → 解析 Payload → 组装 ReviewState 初始结构
-2. 推入 Redis Stream 队列 (mr_review_queue)
-3. 立即返回 {"status": "processing"}
-4. 独立 Worker 进程消费队列并执行 Graph
+支持的事件：
+- GitLab: merge_request (open/update/reopen), note (MR 评论)
+- GitHub: pull_request (opened/synchronize/reopened), issue_comment (PR 评论)
 
-优势：
-- Webhook 接口与 Graph 执行完全解耦
-- Worker 崩溃后消息不丢失（Redis Stream ACK 机制）
-- 支持多 Worker 水平扩展
+评论触发命令：
+- @autoreviewer review — 重新审查整个 PR
+- @autoreviewer fix — 对审查问题执行自动修复
 """
 
 import hashlib
 import hmac
+import json
 import logging
 import os
-from typing import Any, Dict
+import re
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -26,6 +25,13 @@ from app.vcs.base import DiffResult
 from app.vcs.gitlab_client import GitLabProvider
 from app.vcs.github_client import GitHubProvider
 from app.infra.queue import review_queue
+
+# Bot 命令前缀（PR 评论中 @bot 触发）
+_BOT_MENTION = "autoreviewer"
+_CMD_PATTERN = re.compile(
+    rf"@{_BOT_MENTION}\s+(review|fix)(?:\s|$)",
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,25 +71,32 @@ def _verify_gitlab_token(token_header: str) -> bool:
 # ─────────────────────────────────────────────
 
 
+def _parse_comment_command(comment_body: str) -> Optional[str]:
+    """从评论内容中解析 bot 命令。
+
+    Returns:
+        命令字符串 ("review" / "fix") 或 None（非 bot 命令）
+    """
+    match = _CMD_PATTERN.search(comment_body)
+    if match:
+        return match.group(1).lower()
+    return None
+
+
 async def _enqueue_review_task(
     vcs_provider: str,
     repo_id: str,
     pr_id: str,
+    trigger_type: str = "webhook_pr",
 ) -> None:
-    """拉取 Diff 并将审查任务推入队列。
-
-    注意：此处仅做轻量级 Diff 拉取和语言检测，
-    重逻辑（LLM 审查、沙盒测试）全部由 Worker 消费后执行。
-    """
+    """拉取 Diff 并将审查任务推入队列。"""
     provider = None
     try:
         provider = _create_vcs_provider(vcs_provider)
 
-        # 拉取 Diff（轻量操作）
         logger.info("正在获取 %s %s!%s 的 diff...", vcs_provider, repo_id, pr_id)
         diff_result: DiffResult = await provider.get_diff(repo_id, pr_id)
 
-        # 获取 Repo Map（VCS API 优先，失败则降级为本地目录树）
         try:
             repo_map = await provider.get_repo_map(repo_id)
         except Exception as e:
@@ -91,7 +104,6 @@ async def _enqueue_review_task(
             from app.core.repo_mapper import generate_repo_map
             repo_map = generate_repo_map(".")
 
-        # 按语言拆分 diff_chunks
         diff_chunks: Dict[str, str] = {}
         for file_info in diff_result.files:
             lang = file_info.get("language")
@@ -99,20 +111,18 @@ async def _enqueue_review_task(
                 diff_chunks.setdefault(lang, "")
                 diff_chunks[lang] += f"--- {file_info['file_path']}\n{file_info['diff']}\n"
 
-        # 组装任务 payload
         task = {
             "vcs_provider": vcs_provider,
             "pr_id": pr_id,
             "repo_id": repo_id,
-            "trigger_type": "webhook_pr",
+            "trigger_type": trigger_type,
             "repo_context": repo_map,
             "diff_chunks": diff_chunks,
             "detected_languages": diff_result.languages_detected,
         }
 
-        # 推入队列
         message_id = await review_queue.publish(task)
-        logger.info("任务已入队: %s!%s, msg_id=%s", vcs_provider, repo_id, message_id)
+        logger.info("任务已入队: %s!%s, trigger=%s, msg_id=%s", vcs_provider, repo_id, trigger_type, message_id)
 
     except Exception as e:
         logger.error("任务入队失败: %s!%s, error=%s", vcs_provider, repo_id, e, exc_info=True)
@@ -144,42 +154,64 @@ def _create_vcs_provider(provider_name: str):
 
 @router.post("/gitlab")
 async def gitlab_webhook(request: Request) -> Dict[str, str]:
-    """接收 GitLab Merge Request Webhook。
-
-    流程：验证签名 → 解析 → 校验 → 推队列 → 立即返回 200
-    """
-    # 验证 GitLab Secret Token
+    """接收 GitLab Webhook（MR 事件 + MR 评论事件）。"""
     token = request.headers.get("X-Gitlab-Token", "")
     if not _verify_gitlab_token(token):
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
     body = await _parse_body(request)
-
     object_kind = body.get("object_kind")
-    if object_kind != "merge_request":
-        return {"status": "ignored", "reason": "not a merge_request event"}
 
-    try:
-        payload = GitLabWebhookPayload(**body)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Payload validation error: {e}")
+    # ── MR 事件 ──
+    if object_kind == "merge_request":
+        try:
+            payload = GitLabWebhookPayload(**body)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Payload validation error: {e}")
 
-    action = payload.object_attributes.action
-    if action not in ("open", "update", "reopen"):
-        return {"status": "ignored", "reason": f"action '{action}' not handled"}
+        action = payload.object_attributes.action
+        if action not in ("open", "update", "reopen"):
+            return {"status": "ignored", "reason": f"action '{action}' not handled"}
 
-    logger.info(
-        "收到 GitLab Webhook: project=%d, MR iid=%d, action=%s",
-        payload.project_id, payload.mr_iid, action,
-    )
+        logger.info("收到 GitLab MR Webhook: project=%d, MR iid=%d, action=%s",
+                     payload.project_id, payload.mr_iid, action)
 
-    await _enqueue_review_task(
-        vcs_provider="gitlab",
-        repo_id=str(payload.project_id),
-        pr_id=str(payload.mr_iid),
-    )
+        await _enqueue_review_task(
+            vcs_provider="gitlab",
+            repo_id=str(payload.project_id),
+            pr_id=str(payload.mr_iid),
+        )
+        return {"status": "processing"}
 
-    return {"status": "processing"}
+    # ── MR 评论事件 ──
+    if object_kind == "note":
+        noteable_type = body.get("noteable_type", "")
+        if noteable_type != "MergeRequest":
+            return {"status": "ignored", "reason": f"note on {noteable_type}"}
+
+        comment_body = body.get("object_attributes", {}).get("note", "")
+        command = _parse_comment_command(comment_body)
+        if not command:
+            return {"status": "ignored", "reason": "not a bot command"}
+
+        project_id = body.get("project", {}).get("id", "")
+        mr_iid = body.get("merge_request", {}).get("iid", "")
+
+        if not project_id or not mr_iid:
+            return {"status": "ignored", "reason": "missing project/mr info"}
+
+        trigger_type = f"webhook_comment:{command}"
+        logger.info("收到 GitLab 评论命令: project=%s, MR=%s, command=%s", project_id, mr_iid, command)
+
+        await _enqueue_review_task(
+            vcs_provider="gitlab",
+            repo_id=str(project_id),
+            pr_id=str(mr_iid),
+            trigger_type=trigger_type,
+        )
+        return {"status": "processing", "command": command}
+
+    return {"status": "ignored", "reason": f"unhandled event: {object_kind}"}
 
 
 # ─────────────────────────────────────────────
@@ -189,40 +221,73 @@ async def gitlab_webhook(request: Request) -> Dict[str, str]:
 
 @router.post("/github")
 async def github_webhook(request: Request) -> Dict[str, str]:
-    """接收 GitHub Pull Request Webhook。
-
-    流程：验证签名 → 解析 → 校验 → 推队列 → 立即返回 200
-    """
-    # 验证 GitHub HMAC-SHA256 签名
+    """接收 GitHub Webhook（PR 事件 + PR 评论事件）。"""
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
     if not _verify_github_signature(raw_body, signature):
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
-    import json
     body = json.loads(raw_body)
 
-    action = body.get("action", "")
-    if action not in ("opened", "synchronize", "reopened"):
-        return {"status": "ignored", "reason": f"action '{action}' not handled"}
+    # 通过 GitHub Webhook-Event header 区分事件类型
+    event_type = request.headers.get("X-GitHub-Event", "")
 
-    try:
-        payload = GitHubWebhookPayload(**body)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Payload validation error: {e}")
+    # ── PR 事件 ──
+    if event_type == "pull_request":
+        action = body.get("action", "")
+        if action not in ("opened", "synchronize", "reopened"):
+            return {"status": "ignored", "reason": f"action '{action}' not handled"}
 
-    logger.info(
-        "收到 GitHub Webhook: repo=%s, PR #%d, action=%s",
-        payload.repo_full_name, payload.pr_number, action,
-    )
+        try:
+            payload = GitHubWebhookPayload(**body)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Payload validation error: {e}")
 
-    await _enqueue_review_task(
-        vcs_provider="github",
-        repo_id=payload.repo_full_name,
-        pr_id=str(payload.pr_number),
-    )
+        logger.info("收到 GitHub PR Webhook: repo=%s, PR #%d, action=%s",
+                     payload.repo_full_name, payload.pr_number, action)
 
-    return {"status": "processing"}
+        await _enqueue_review_task(
+            vcs_provider="github",
+            repo_id=payload.repo_full_name,
+            pr_id=str(payload.pr_number),
+        )
+        return {"status": "processing"}
+
+    # ── PR 评论事件 ──
+    if event_type == "issue_comment":
+        action = body.get("action", "")
+        if action != "created":
+            return {"status": "ignored", "reason": f"comment action '{action}' not handled"}
+
+        # 确认是对 PR 的评论（非普通 issue）
+        issue = body.get("issue", {})
+        if "pull_request" not in issue:
+            return {"status": "ignored", "reason": "comment on issue, not PR"}
+
+        comment_body = body.get("comment", {}).get("body", "")
+        command = _parse_comment_command(comment_body)
+        if not command:
+            return {"status": "ignored", "reason": "not a bot command"}
+
+        repo_full_name = body.get("repository", {}).get("full_name", "")
+        pr_number = issue.get("number", "")
+
+        if not repo_full_name or not pr_number:
+            return {"status": "ignored", "reason": "missing repo/pr info"}
+
+        trigger_type = f"webhook_comment:{command}"
+        logger.info("收到 GitHub 评论命令: repo=%s, PR=#%s, command=%s",
+                     repo_full_name, pr_number, command)
+
+        await _enqueue_review_task(
+            vcs_provider="github",
+            repo_id=repo_full_name,
+            pr_id=str(pr_number),
+            trigger_type=trigger_type,
+        )
+        return {"status": "processing", "command": command}
+
+    return {"status": "ignored", "reason": f"unhandled event: {event_type}"}
 
 
 # ─────────────────────────────────────────────
