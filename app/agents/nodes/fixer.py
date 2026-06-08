@@ -74,14 +74,23 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
     try:
         output: FixerOutput = await structured_llm.ainvoke([system_msg, human_msg])
     except Exception as e:
-        if "429" in str(e):
+        error_str = str(e)
+        error_type = "unknown"
+        if "429" in error_str:
+            error_type = "429"
             logger.warning("Fixer 触发 rate limit (429)，保留已有结果")
+        elif "timeout" in error_str.lower():
+            error_type = "timeout"
+        elif "connection" in error_str.lower():
+            error_type = "connection"
         else:
             logger.error("Fixer LLM 调用失败: %s", e)
         return {
             "search_replace_blocks": state.get("search_replace_blocks", []),
             "retry_count": state["retry_count"],
             "error_count": state.get("error_count", 0) + 1,
+            "error_type": error_type,
+            "last_node": "fixer_node",
         }
 
     logger.info(

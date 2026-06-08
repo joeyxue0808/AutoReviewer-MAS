@@ -1,13 +1,18 @@
-"""LangGraph 状态机定义 - Blueprint V2.0 数据模型。
+"""LangGraph 状态机定义 - Blueprint V3.0 数据模型。
 
 V2 变更点：
 - 支持多 VCS 平台 (gitlab / github / cli)
 - 按语言拆分 diff_chunks，防止上下文爆炸
 - Fixer 输出 SearchReplaceBlock 替代 Unified Diff
 - 增加 trigger_type 区分触发来源
+
+V3.0 变更点：
+- 新增 error_type / last_node 字段，支持错误恢复节点路由
+- 新增 error_count 用于连续错误计数和降级判断
 """
 
-from typing import Any, Dict, List, TypedDict
+import operator
+from typing import Annotated, Any, Dict, List, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -54,7 +59,7 @@ class SearchReplaceBlock(BaseModel):
 
 
 class ReviewState(TypedDict):
-    """LangGraph 全局状态定义 - V2 增强版。
+    """LangGraph 全局状态定义 - V3.0 增强版。
 
     所有节点通过读写此 TypedDict 进行数据流转。
     """
@@ -73,7 +78,9 @@ class ReviewState(TypedDict):
     detected_languages: List[str]  # 识别出的技术栈列表，如 ["go", "vue"]
 
     # ── 审查结果 ──
-    review_issues: List[Dict[str, Any]]  # Reviewer Agent 发现的问题
+    # Annotated[list, operator.add] 允许 Send API 并发多个 reviewer_node 同时写入，
+    # 各自的结果会自动合并（列表拼接），而非冲突报错
+    review_issues: Annotated[List[Dict[str, Any]], operator.add]  # Reviewer Agent 发现的问题
 
     # ── Fixer 输出（Search/Replace 格式）──
     search_replace_blocks: List[Dict[str, Any]]  # Fixer 输出的搜索/替换块
@@ -83,3 +90,7 @@ class ReviewState(TypedDict):
     is_test_passed: bool  # 测试是否通过
     retry_count: int  # Fixer <-> Tester 的循环重试次数
     error_count: int  # 连续错误计数（429 等，用于防止死循环）
+
+    # ── 错误恢复 (V3.0) ──
+    error_type: str  # 错误类型: "429" / "timeout" / "connection" / ""
+    last_node: str  # 出错的节点名（用于 error_recovery 路由回原节点）

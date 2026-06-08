@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Literal
 from langgraph.graph import END, StateGraph
 
 from app.agents.nodes.critic import critic_node
+from app.agents.nodes.error_recovery import error_recovery_node
 from app.agents.nodes.fixer import fixer_node
 from app.agents.nodes.reviewer import reviewer_node
 from app.agents.nodes.tester import tester_node
@@ -100,6 +101,8 @@ def _make_sub_state(
         "is_test_passed": False,
         "retry_count": 0,
         "error_count": 0,
+        "error_type": "",
+        "last_node": "",
     }
 
 
@@ -108,8 +111,13 @@ def _make_sub_state(
 # ─────────────────────────────────────────────
 
 
-def _after_reviewer(state: ReviewState) -> Literal["fixer_node", "__end__"]:
-    """Reviewer 之后：有 critical 问题 → fixer，否则 → END。"""
+def _after_reviewer(state: ReviewState) -> Literal["fixer_node", "error_recovery_node", "__end__"]:
+    """Reviewer 之后：错误 → error_recovery，有 critical 问题 → fixer，否则 → END。"""
+    # 错误恢复路由
+    if state.get("error_type"):
+        logger.info("Reviewer 出错 (%s)，进入 error_recovery", state["error_type"])
+        return "error_recovery_node"
+
     critical_issues = [
         issue for issue in state.get("review_issues", [])
         if (issue.get("severity") if isinstance(issue, dict) else getattr(issue, "severity", "")) == "critical"
@@ -124,7 +132,11 @@ def _after_reviewer(state: ReviewState) -> Literal["fixer_node", "__end__"]:
 
 
 def _after_critic(state: ReviewState) -> Literal["tester_node", "fixer_node"]:
-    """Critic 之后：通过 → tester，拒绝 → 回到 fixer（带重试上限）。"""
+    """Critic 之后：通过 → tester，拒绝 → 回到 fixer（带重试上限）。
+
+    注意：Fixer 的错误已在 fixer_node 内处理（设置 error_count），
+    Critic 本身不会出错（纯规则检查），无需 error_recovery 路由。
+    """
     blocks = state.get("search_replace_blocks", [])
     retry_count = state.get("retry_count", 0)
     error_count = state.get("error_count", 0)
@@ -312,16 +324,20 @@ def build_graph() -> StateGraph:
     graph.add_node("critic_node", critic_node)
     graph.add_node("tester_node", tester_node)
     graph.add_node("submit_node", submit_node)
+    graph.add_node("error_recovery_node", error_recovery_node)
 
     # router 使用 Send API 动态分发
     graph.add_conditional_edges("__start__", router_node)
 
-    # reviewer → (fixer | END)
+    # reviewer → (fixer | error_recovery | END)
     graph.add_conditional_edges(
         "reviewer_node",
         _after_reviewer,
-        {"fixer_node": "fixer_node", "__end__": END},
+        {"fixer_node": "fixer_node", "error_recovery_node": "error_recovery_node", "__end__": END},
     )
+
+    # error_recovery → reviewer（恢复后重试）
+    graph.add_edge("error_recovery_node", "reviewer_node")
 
     # fixer → critic
     graph.add_edge("fixer_node", "critic_node")

@@ -83,8 +83,21 @@ async def reviewer_node(state: ReviewState) -> Dict[str, Any]:
     try:
         output: ReviewerOutput = await structured_llm.ainvoke([system_msg, human_msg])
     except Exception as e:
-        logger.error("Reviewer LLM 调用失败: %s", e)
-        return {"review_issues": []}
+        error_str = str(e)
+        error_type = "unknown"
+        if "429" in error_str:
+            error_type = "429"
+        elif "timeout" in error_str.lower():
+            error_type = "timeout"
+        elif "connection" in error_str.lower():
+            error_type = "connection"
+        logger.error("Reviewer LLM 调用失败: %s (type=%s)", e, error_type)
+        return {
+            "review_issues": [],
+            "error_type": error_type,
+            "last_node": "reviewer_node",
+            "error_count": state.get("error_count", 0) + 1,
+        }
 
     logger.info(
         "Reviewer 完成: 发现 %d 个问题, is_approved=%s",
