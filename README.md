@@ -89,17 +89,20 @@ cp config/settings.yaml.example config/settings.yaml
 Set environment variables **in the project root directory** before running. You can use a `.env` file or export directly:
 
 ```bash
-# Option 1: Create .env file in project root
-cat > .env << 'EOF'
-MIMO_API_KEY=your-api-key-here
-GITHUB_TOKEN=your-github-token
-GITLAB_TOKEN=your-gitlab-token
-EOF
-
-# Option 2: Export in shell (must be in project directory)
+# Option 1: Export in shell (persists for current session)
 export MIMO_API_KEY=your-api-key-here
 export GITHUB_TOKEN=your-github-token
+
+# Option 2: Create .env file in AutoReviewer-MAS project root
+# (only works when running from AutoReviewer-MAS directory)
+cat > /path/to/AutoReviewer-MAS/.env << 'EOF'
+MIMO_API_KEY=your-api-key-here
+GITHUB_TOKEN=your-github-token
+EOF
 ```
+
+> 💡 **Tip**: When reviewing other projects, export env vars in your shell profile
+> (`~/.bashrc`, `~/.zshrc`, or PowerShell `$PROFILE`) so they are always available.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -113,12 +116,36 @@ export GITHUB_TOKEN=your-github-token
 
 ### Usage
 
-**CLI Local Review (no external dependencies needed):**
+**CLI Local Review (review code in any project):**
+
+> ⚠️ **Important**: The CLI must be able to import the `app` module from AutoReviewer-MAS.
+> You have two options:
+
+**Option A — Install as editable package (recommended):**
 ```bash
+# In AutoReviewer-MAS directory, install once:
+cd /path/to/AutoReviewer-MAS
+pip install -e .
+
+# Then in ANY project directory:
+cd /path/to/your-project
 python -m app.cli.main local
 python -m app.cli.main local --all
 python -m app.cli.main local --branch feature/auth
 ```
+
+**Option B — Set PYTHONPATH:**
+```bash
+# Set PYTHONPATH to AutoReviewer-MAS directory before running:
+export PYTHONPATH=/path/to/AutoReviewer-MAS
+
+# Then in any project directory:
+cd /path/to/your-project
+python -m app.cli.main local
+```
+
+> 💡 Environment variables (`MIMO_API_KEY`, etc.) must be set in the shell
+> where you run the command, not necessarily in the project directory.
 
 **API Server (webhook mode):**
 ```bash

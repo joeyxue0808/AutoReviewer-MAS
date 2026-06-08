@@ -94,20 +94,21 @@ cp config/settings.yaml.example config/settings.yaml
 
 ### 环境变量
 
-在项目根目录下设置环境变量后才能正常运行。推荐使用 `.env` 文件或直接 export：
+运行前必须设置以下环境变量。推荐写入 shell 配置文件（`~/.bashrc`、`~/.zshrc` 或 PowerShell `$PROFILE`）使其永久生效：
 
 ```bash
-# 方式一：在项目根目录创建 .env 文件
-cat > .env << 'EOF'
-MIMO_API_KEY=你的API密钥
-GITHUB_TOKEN=你的GitHub Token
-GITLAB_TOKEN=你的GitLab Token
-EOF
-
-# 方式二：在 shell 中 export（需在项目目录下执行）
+# Linux/macOS — 写入 ~/.bashrc 或 ~/.zshrc
 export MIMO_API_KEY=你的API密钥
 export GITHUB_TOKEN=你的GitHub Token
+export GITLAB_TOKEN=你的GitLab Token
+
+# Windows PowerShell — 写入 $PROFILE
+$env:MIMO_API_KEY = "你的API密钥"
+$env:GITHUB_TOKEN = "你的GitHub Token"
 ```
+
+> 💡 **提示**：如果在其他项目目录下运行 CLI，环境变量需要在**当前 shell 会话**中可用，
+> 不是写在 AutoReviewer-MAS 的 `.env` 文件里。
 
 | 变量 | 必需 | 说明 |
 |------|------|------|
@@ -121,12 +122,35 @@ export GITHUB_TOKEN=你的GitHub Token
 
 ### 使用方式
 
-**CLI 本地审查（无需外部依赖）：**
+**CLI 本地审查（在任意项目目录下审查代码）：**
+
+> ⚠️ **重要**：CLI 需要能 `import app` 模块，因此必须让 Python 能找到 AutoReviewer-MAS 的路径。
+> 有两种方式：
+
+**方式一 — 以可编辑模式安装（推荐，一次配置永久生效）：**
 ```bash
+# 在 AutoReviewer-MAS 目录下安装一次：
+cd /path/to/AutoReviewer-MAS
+pip install -e .
+
+# 然后在任意项目目录下直接使用：
+cd /path/to/your-project
 python -m app.cli.main local          # 审查当前分支
 python -m app.cli.main local --all    # 审查所有变更
 python -m app.cli.main local --branch feature/auth  # 指定分支
 ```
+
+**方式二 — 设置 PYTHONPATH 环境变量：**
+```bash
+# 每次使用前设置 PYTHONPATH 指向 AutoReviewer-MAS 目录：
+export PYTHONPATH=/path/to/AutoReviewer-MAS
+
+# 然后在任意项目目录下：
+cd /path/to/your-project
+python -m app.cli.main local
+```
+
+> 💡 Windows PowerShell 用户使用：`$env:PYTHONPATH = "D:\path\to\AutoReviewer-MAS"`
 
 **API 服务（Webhook 模式）：**
 ```bash
