@@ -157,12 +157,16 @@ def _display_diff_summary(diff_text: str) -> None:
 
 
 async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
-    """执行审查流水线。"""
-    from app.agents.workflow import compile_graph
+    """执行审查流水线 — 两阶段交互模式。
+
+    阶段 1: Reviewer 审查 → 展示问题清单 → 用户选择修复项
+    阶段 2: Fixer 修复 → Critic 校验 → Tester 测试 → 提交报告
+    """
+    from app.agents.workflow import build_review_only_graph, build_fix_only_graph
     from app.core.diff_analyzer import DiffAnalyzer
     from app.schemas.state import ReviewState
 
-    # DiffAnalyzer 检测语言和拆分
+    # ── 准备阶段 ──
     analyzer = DiffAnalyzer()
     detected = analyzer.detect_languages(diff_text)
     chunk_list = analyzer.chunk_diff(diff_text)
@@ -174,15 +178,12 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
     console.print(f"[cyan]🔍 检测到语言: {', '.join(detected)}[/cyan]")
     console.print(f"[cyan]📦 切分为 {len(chunk_list)} 个 Chunk (防上下文爆炸)[/cyan]")
 
-    # 转换为 ReviewState 需要的 Dict[str, str] 格式
     diff_chunks = {c.chunk_id: c.content for c in chunk_list}
 
-    # 生成 Repo-Map 全局上下文 (Implementation Guide Phase 5 Task 5.1)
     from app.core.repo_mapper import generate_repo_map
     repo_context = generate_repo_map(repo_root)
     console.print(f"[cyan]🗺️  Repo-Map 已生成 ({len(repo_context)} chars)[/cyan]")
 
-    # 构建初始状态
     initial_state: ReviewState = {
         "vcs_provider": "cli",
         "pr_id": f"local-{branch}",
@@ -197,12 +198,13 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
         "is_test_passed": False,
         "retry_count": 0,
         "error_count": 0,
+        "error_type": "",
+        "last_node": "",
     }
 
-    # 编译 Graph（CLI 模式不启用 HITL 挂起）
-    graph = compile_graph(interrupt_before=[])
+    # ── 阶段 1: 审查 ──
+    review_graph = build_review_only_graph().compile()
 
-    # 执行审查（带进度显示）
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -211,7 +213,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
         task = progress.add_task("🤖 Agent 审查中...", total=None)
 
         try:
-            final_state = await graph.ainvoke(initial_state)
+            review_state = await review_graph.ainvoke(initial_state)
         except Exception as e:
             progress.update(task, description=f"[red]❌ 审查失败: {e}[/red]")
             console.print_exception()
@@ -219,8 +221,123 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
 
         progress.update(task, description="[green]✅ 审查完成[/green]")
 
-    # 显示结果
+    issues = review_state.get("review_issues", [])
+
+    # ── 用户交互：选择修复项 ──
+    if not issues:
+        console.print(Panel(
+            "[bold green]✅ 未发现问题 — 代码审查通过[/bold green]",
+            border_style="green",
+            padding=(0, 2),
+        ))
+        return
+
+    selected_issues = _prompt_issue_selection(issues)
+
+    if not selected_issues:
+        console.print("[yellow]⏭️  已跳过所有修复，审查结束[/yellow]")
+        return
+
+    # ── 阶段 2: 修复（仅处理用户选中的问题）──
+    fix_state = dict(review_state)
+    fix_state["review_issues"] = selected_issues
+    fix_state["search_replace_blocks"] = []
+    fix_state["test_logs"] = ""
+    fix_state["is_test_passed"] = False
+    fix_state["retry_count"] = 0
+    fix_state["error_count"] = 0
+    fix_state["error_type"] = ""
+    fix_state["last_node"] = ""
+
+    fix_graph = build_fix_only_graph().compile()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("🔧 Agent 修复中...", total=None)
+
+        try:
+            final_state = await fix_graph.ainvoke(fix_state)
+        except Exception as e:
+            progress.update(task, description=f"[red]❌ 修复失败: {e}[/red]")
+            console.print_exception()
+            raise typer.Exit(1)
+
+        progress.update(task, description="[green]✅ 修复完成[/green]")
+
+    # 显示最终结果（合并审查问题和修复结果）
+    final_state["review_issues"] = issues  # 显示全部原始问题
     _display_results(final_state)
+
+
+def _prompt_issue_selection(issues: list) -> list:
+    """展示审查问题清单，让用户选择要修复的项。
+
+    Returns:
+        用户选中的 issue 子列表
+    """
+    sev_icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
+    sev_style = {"critical": "bold red", "warning": "yellow", "info": "cyan"}
+
+    # 展示问题清单
+    console.print()
+    console.print(Panel(
+        f"[bold]🔍 发现 {len(issues)} 个问题 — 请选择要修复的项目[/bold]",
+        border_style="blue",
+    ))
+    console.print()
+
+    for i, issue in enumerate(issues, 1):
+        sev = issue.get("severity", "info")
+        fp = issue.get("file_path", "")
+        ln = issue.get("line_number", "")
+        desc = issue.get("description", "")
+        sug = issue.get("suggestion", "")
+
+        loc = f"{fp}:{ln}" if ln else fp
+        content = (
+            f"[{sev_style.get(sev, 'white')}]{sev_icon.get(sev, '•')} [{sev.upper()}][/] "
+            f"[cyan]{loc}[/cyan]\n\n{desc}"
+        )
+        if sug:
+            content += f"\n[green]💡 建议:[/green] {sug}"
+
+        console.print(Panel(
+            content,
+            title=f"[bold]#{i}[/bold]",
+            border_style=sev_style.get(sev, "white"),
+            padding=(0, 1),
+        ))
+
+    # 交互提示
+    console.print()
+    console.print("[bold]选择操作:[/bold]")
+    console.print("  [cyan]a[/cyan] — 修复全部问题")
+    console.print("  [cyan]1,3,5[/cyan] — 修复指定编号（逗号分隔）")
+    console.print("  [cyan]n[/cyan] — 跳过，不修复")
+    console.print()
+
+    choice = console.input("[bold green]请输入选择 > [/bold green]").strip().lower()
+
+    if choice == "n" or choice == "":
+        return []
+    elif choice == "a":
+        return issues
+    else:
+        try:
+            indices = [int(x.strip()) for x in choice.split(",")]
+            selected = []
+            for idx in indices:
+                if 1 <= idx <= len(issues):
+                    selected.append(issues[idx - 1])
+                else:
+                    console.print(f"[yellow]⚠️  忽略无效编号: {idx}[/yellow]")
+            return selected
+        except ValueError:
+            console.print("[yellow]⚠️  输入格式无效，跳过修复[/yellow]")
+            return []
 
 
 def _display_results(state: dict) -> None:

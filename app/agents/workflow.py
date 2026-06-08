@@ -377,3 +377,64 @@ def compile_graph(checkpointer=None, interrupt_before: list[str] | None = None):
 
 # 默认实例
 app_graph = compile_graph()
+
+
+# ─────────────────────────────────────────────
+# 子图构建（用于 CLI 交互式审查）
+# ─────────────────────────────────────────────
+
+
+def build_review_only_graph() -> StateGraph:
+    """构建仅包含审查阶段的子图。
+
+    拓扑：router → Send(reviewer) → END
+
+    用于 CLI 交互模式：先审查拿到问题清单，
+    用户选择后再执行修复阶段。
+    """
+    graph = StateGraph(ReviewState)
+    graph.add_node("reviewer_node", reviewer_node)
+    graph.add_conditional_edges("__start__", router_node)
+    graph.add_edge("reviewer_node", END)
+    return graph
+
+
+def build_fix_only_graph() -> StateGraph:
+    """构建仅包含修复阶段的子图。
+
+    拓扑：fixer → critic → tester → submit → END
+          (critic/tester 可回退到 fixer，最多 3 轮)
+
+    用于 CLI 交互模式：用户选择问题后执行修复。
+    """
+    graph = StateGraph(ReviewState)
+
+    graph.add_node("fixer_node", fixer_node)
+    graph.add_node("critic_node", critic_node)
+    graph.add_node("tester_node", tester_node)
+    graph.add_node("submit_node", submit_node)
+
+    # __start__ → fixer
+    graph.add_edge("__start__", "fixer_node")
+
+    # fixer → critic
+    graph.add_edge("fixer_node", "critic_node")
+
+    # critic → (tester | fixer)
+    graph.add_conditional_edges(
+        "critic_node",
+        _after_critic,
+        {"tester_node": "tester_node", "fixer_node": "fixer_node"},
+    )
+
+    # tester → (fixer | submit)
+    graph.add_conditional_edges(
+        "tester_node",
+        _after_tester,
+        {"fixer_node": "fixer_node", "submit_node": "submit_node"},
+    )
+
+    # submit → END
+    graph.add_edge("submit_node", END)
+
+    return graph
