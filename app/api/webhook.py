@@ -1,7 +1,7 @@
 """FastAPI Webhook 接口 - Phase 1 消息队列削峰重构。
 
 废弃 BackgroundTasks，改为：
-1. 接收 Webhook → 解析 Payload → 组装 ReviewState 初始结构
+1. 接收 Webhook → 验证签名 → 解析 Payload → 组装 ReviewState 初始结构
 2. 推入 Redis Stream 队列 (mr_review_queue)
 3. 立即返回 {"status": "processing"}
 4. 独立 Worker 进程消费队列并执行 Graph
@@ -12,7 +12,10 @@
 - 支持多 Worker 水平扩展
 """
 
+import hashlib
+import hmac
 import logging
+import os
 from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Request
@@ -30,6 +33,34 @@ router = APIRouter(prefix="/api/v1/webhook", tags=["webhook"])
 
 
 # ─────────────────────────────────────────────
+# Webhook 签名验证
+# ─────────────────────────────────────────────
+
+
+def _verify_github_signature(payload_body: bytes, signature_header: str) -> bool:
+    """验证 GitHub Webhook HMAC-SHA256 签名。"""
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+    if not secret:
+        logger.warning("GITHUB_WEBHOOK_SECRET 未设置，跳过签名验证")
+        return True
+    if not signature_header:
+        return False
+    expected = "sha256=" + hmac.new(secret.encode(), payload_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+
+
+def _verify_gitlab_token(token_header: str) -> bool:
+    """验证 GitLab Webhook Secret Token。"""
+    secret = os.getenv("GITLAB_WEBHOOK_SECRET", "")
+    if not secret:
+        logger.warning("GITLAB_WEBHOOK_SECRET 未设置，跳过签名验证")
+        return True
+    if not token_header:
+        return False
+    return hmac.compare_digest(token_header, secret)
+
+
+# ─────────────────────────────────────────────
 # 核心：组装任务并推入队列
 # ─────────────────────────────────────────────
 
@@ -44,9 +75,10 @@ async def _enqueue_review_task(
     注意：此处仅做轻量级 Diff 拉取和语言检测，
     重逻辑（LLM 审查、沙盒测试）全部由 Worker 消费后执行。
     """
-    provider = _create_vcs_provider(vcs_provider)
-
+    provider = None
     try:
+        provider = _create_vcs_provider(vcs_provider)
+
         # 拉取 Diff（轻量操作）
         logger.info("正在获取 %s %s!%s 的 diff...", vcs_provider, repo_id, pr_id)
         diff_result: DiffResult = await provider.get_diff(repo_id, pr_id)
@@ -86,7 +118,8 @@ async def _enqueue_review_task(
         logger.error("任务入队失败: %s!%s, error=%s", vcs_provider, repo_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to enqueue task: {e}")
     finally:
-        await provider.close()
+        if provider:
+            await provider.close()
 
 
 def _create_vcs_provider(provider_name: str):
@@ -113,8 +146,13 @@ def _create_vcs_provider(provider_name: str):
 async def gitlab_webhook(request: Request) -> Dict[str, str]:
     """接收 GitLab Merge Request Webhook。
 
-    流程：解析 → 校验 → 拉 Diff → 推队列 → 立即返回 200
+    流程：验证签名 → 解析 → 校验 → 推队列 → 立即返回 200
     """
+    # 验证 GitLab Secret Token
+    token = request.headers.get("X-Gitlab-Token", "")
+    if not _verify_gitlab_token(token):
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
     body = await _parse_body(request)
 
     object_kind = body.get("object_kind")
@@ -153,9 +191,16 @@ async def gitlab_webhook(request: Request) -> Dict[str, str]:
 async def github_webhook(request: Request) -> Dict[str, str]:
     """接收 GitHub Pull Request Webhook。
 
-    流程：解析 → 校验 → 拉 Diff → 推队列 → 立即返回 200
+    流程：验证签名 → 解析 → 校验 → 推队列 → 立即返回 200
     """
-    body = await _parse_body(request)
+    # 验证 GitHub HMAC-SHA256 签名
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not _verify_github_signature(raw_body, signature):
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
+    import json
+    body = json.loads(raw_body)
 
     action = body.get("action", "")
     if action not in ("opened", "synchronize", "reopened"):

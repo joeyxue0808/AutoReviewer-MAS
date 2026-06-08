@@ -83,12 +83,11 @@ async def critic_node(state: ReviewState) -> Dict[str, Any]:
     if issues:
         reason = "; ".join(issues)
         logger.warning("Critic 拒绝: %s", reason)
-        retry_count = state.get("retry_count", 0)
+        # 注意：retry_count 由 workflow 层统一管理，Critic 不递增
         return {
             "search_replace_blocks": [],
             "test_logs": f"Critic 拒绝: {reason}",
             "is_test_passed": False,
-            "retry_count": retry_count + 1,
         }
 
     logger.info("Critic 通过: 所有 %d 个 block 规则检查合格", len(blocks))
