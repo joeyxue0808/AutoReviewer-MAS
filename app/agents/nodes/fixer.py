@@ -81,6 +81,7 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
         return {
             "search_replace_blocks": state.get("search_replace_blocks", []),
             "retry_count": state["retry_count"],
+            "error_count": state.get("error_count", 0) + 1,
         }
 
     logger.info(

@@ -187,6 +187,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
         "vcs_provider": "cli",
         "pr_id": f"local-{branch}",
         "trigger_type": "cli",
+        "repo_id": repo_root,
         "repo_context": repo_context,
         "diff_chunks": diff_chunks,
         "detected_languages": detected,
@@ -195,6 +196,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
         "test_logs": "",
         "is_test_passed": False,
         "retry_count": 0,
+        "error_count": 0,
     }
 
     # 编译 Graph（CLI 模式不启用 HITL 挂起）

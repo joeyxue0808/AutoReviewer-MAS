@@ -91,6 +91,7 @@ def _make_sub_state(
         "vcs_provider": parent.get("vcs_provider", ""),
         "pr_id": parent.get("pr_id", ""),
         "trigger_type": parent.get("trigger_type", "webhook_pr"),
+        "repo_id": parent.get("repo_id", ""),
         "repo_context": parent.get("repo_context", ""),
         "diff_chunks": {chunk_id: diff_content} if diff_content else {},
         "detected_languages": languages,
@@ -99,6 +100,7 @@ def _make_sub_state(
         "test_logs": "",
         "is_test_passed": False,
         "retry_count": 0,
+        "error_count": 0,
     }
 
 
@@ -126,11 +128,14 @@ def _after_critic(state: ReviewState) -> Literal["tester_node", "fixer_node"]:
     """Critic 之后：通过 → tester，拒绝 → 回到 fixer（带重试上限）。"""
     blocks = state.get("search_replace_blocks", [])
     retry_count = state.get("retry_count", 0)
+    error_count = state.get("error_count", 0)
+
+    # 连续错误（429 等）达到上限，强制终止
+    if error_count >= 3:
+        logger.warning("连续错误达到上限 (%d)，强制降级提交", error_count)
+        return "tester_node"
 
     if not blocks:
-        # 无 blocks 有两种情况：
-        # 1. Critic 拒绝了有缺陷的 blocks → 应重试
-        # 2. Fixer 因 429/错误返回空 → 不应无限重试
         if retry_count >= settings.max_retry_count:
             logger.warning("Critic: 无 blocks 且已达最大重试 (%d/%d)，降级提交", retry_count, settings.max_retry_count)
             return "tester_node"
@@ -139,7 +144,6 @@ def _after_critic(state: ReviewState) -> Literal["tester_node", "fixer_node"]:
             logger.info("Critic 拒绝，回到 fixer 重试 (%d/%d)", retry_count, settings.max_retry_count)
             return "fixer_node"
 
-        # Fixer 失败（非 Critic 拒绝），直接进入 tester 降级
         logger.info("Critic: 无 blocks（Fixer 可能失败），进入 tester 降级")
         return "tester_node"
 

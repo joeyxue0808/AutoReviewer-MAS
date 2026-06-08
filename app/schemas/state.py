@@ -63,12 +63,13 @@ class ReviewState(TypedDict):
     vcs_provider: str  # "gitlab", "github", "cli"
     pr_id: str  # Pull Request / Merge Request ID（字符串，兼容不同平台）
     trigger_type: str  # "webhook_pr", "webhook_comment", "cli"
+    repo_id: str  # VCS 仓库 ID（用于 API 调用）
 
     # ── 仓库上下文 ──
     repo_context: str  # 提取的 Repo-Map（目录结构与全局引用关系）
 
     # ── Diff 按语言拆分 ──
-    diff_chunks: Dict[str, str]  # key: 语言名, value: 该语言的 diff 片段
+    diff_chunks: Dict[str, str]  # key: chunk_id (如 "python_0"), value: diff 内容
     detected_languages: List[str]  # 识别出的技术栈列表，如 ["go", "vue"]
 
     # ── 审查结果 ──
@@ -81,3 +82,4 @@ class ReviewState(TypedDict):
     test_logs: str  # Tester 沙盒执行后的日志
     is_test_passed: bool  # 测试是否通过
     retry_count: int  # Fixer <-> Tester 的循环重试次数
+    error_count: int  # 连续错误计数（429 等，用于防止死循环）
