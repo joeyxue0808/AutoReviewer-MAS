@@ -14,7 +14,7 @@ V3.0 变更点：
 import operator
 from typing import Annotated, Any, Dict, List, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ─────────────────────────────────────────────
@@ -26,11 +26,22 @@ class ReviewIssue(BaseModel):
     """单个代码审查问题。"""
 
     file_path: str = Field(description="问题所在的文件路径")
-    line_number: int = Field(description="问题所在行号")
+    line_number: int = Field(description="问题所在行号", default=0)
     severity: str = Field(description="严重级别: info / warning / critical")
     category: str = Field(default="general", description="问题分类: bug / style / security / performance / general")
     description: str = Field(description="问题描述")
     suggestion: str = Field(description="修复建议")
+
+    @field_validator("line_number", mode="before")
+    @classmethod
+    def coerce_line_number(cls, v):
+        """容忍 LLM 返回字符串行号（如 'N/A'、'unknown'），转为 0。"""
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            digits = "".join(c for c in v if c.isdigit())
+            return int(digits) if digits else 0
+        return 0
 
 
 # ─────────────────────────────────────────────
