@@ -1,11 +1,13 @@
 """精准语言路由矩阵 - Blueprint V2 第 2 节。
 
 定义 9 大技术栈的完整配置映射（后缀、Lint 命令、Test 命令、Docker 镜像）。
-作为常量字典维护，供 DiffAnalyzer 和 SandboxEngine 共同使用。
+作为单一数据源，供 DiffAnalyzer、SandboxEngine、TesterNode 共同使用。
+
+配置优先级：settings.yaml > 硬编码默认值
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 
 @dataclass(frozen=True)
@@ -20,10 +22,10 @@ class LanguageConfig:
 
 
 # ─────────────────────────────────────────────
-# 9 大技术栈路由矩阵（严格遵循 Blueprint V2 第 2 节表格）
+# 9 大技术栈路由矩阵（硬编码默认值，可被 settings.yaml 覆盖）
 # ─────────────────────────────────────────────
 
-LANGUAGE_MATRIX: Dict[str, LanguageConfig] = {
+_DEFAULT_MATRIX: Dict[str, LanguageConfig] = {
     "go": LanguageConfig(
         name="Go",
         suffixes=(".go",),
@@ -89,16 +91,53 @@ LANGUAGE_MATRIX: Dict[str, LanguageConfig] = {
     ),
 }
 
+
+def _load_matrix_from_settings() -> Dict[str, LanguageConfig]:
+    """从 settings.yaml 加载语言矩阵，合并硬编码默认值。"""
+    try:
+        from app.core.config import settings
+        result = {}
+        for lang_key, default_config in _DEFAULT_MATRIX.items():
+            if lang_key in settings.sandbox.matrix:
+                item = settings.sandbox.matrix[lang_key]
+                result[lang_key] = LanguageConfig(
+                    name=default_config.name,
+                    suffixes=tuple(item.suffixes),
+                    lint_command=item.lint_command,
+                    test_command=item.test_command,
+                    image=item.image,
+                )
+            else:
+                result[lang_key] = default_config
+        return result
+    except Exception:
+        return _DEFAULT_MATRIX
+
+
+# 延迟加载的矩阵缓存
+_MATRIX_CACHE: Optional[Dict[str, LanguageConfig]] = None
+
+
+def _get_matrix() -> Dict[str, LanguageConfig]:
+    """获取语言矩阵（优先 settings.yaml，回退硬编码默认值）。"""
+    global _MATRIX_CACHE
+    if _MATRIX_CACHE is None:
+        _MATRIX_CACHE = _load_matrix_from_settings()
+    return _MATRIX_CACHE
+
+
 # 反向索引：后缀 → 语言 key（供 DiffAnalyzer 快速查找）
-_SUFFIX_TO_LANG: Dict[str, str] = {}
-for _lang_key, _config in LANGUAGE_MATRIX.items():
-    for _suffix in _config.suffixes:
-        _SUFFIX_TO_LANG[_suffix] = _lang_key
+def _build_suffix_map() -> Dict[str, str]:
+    result = {}
+    for lang_key, config in _get_matrix().items():
+        for suffix in config.suffixes:
+            result[suffix] = lang_key
+    return result
 
 
 def get_lang_by_suffix(suffix: str) -> str | None:
     """根据文件后缀返回语言 key，未匹配返回 None。"""
-    return _SUFFIX_TO_LANG.get(suffix)
+    return _build_suffix_map().get(suffix)
 
 
 def get_config(lang: str) -> LanguageConfig:
@@ -107,6 +146,13 @@ def get_config(lang: str) -> LanguageConfig:
     Raises:
         KeyError: 语言不在矩阵中
     """
-    if lang not in LANGUAGE_MATRIX:
-        raise KeyError(f"不支持的语言: {lang}，可用: {list(LANGUAGE_MATRIX.keys())}")
-    return LANGUAGE_MATRIX[lang]
+    matrix = _get_matrix()
+    if lang not in matrix:
+        raise KeyError(f"不支持的语言: {lang}，可用: {list(matrix.keys())}")
+    return matrix[lang]
+
+
+def invalidate_cache() -> None:
+    """清除矩阵缓存（用于配置热更新）。"""
+    global _MATRIX_CACHE
+    _MATRIX_CACHE = None

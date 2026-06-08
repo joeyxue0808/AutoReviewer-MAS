@@ -230,8 +230,22 @@ class DiffAnalyzer:
         )
 
     def _estimate_tokens(self, text: str) -> int:
-        """粗略估算文本的 token 数。"""
-        return len(text) // _CHARS_PER_TOKEN
+        """估算文本的 token 数（区分 ASCII 和 CJK 字符）。
+
+        ASCII 字符约 4 字符/token，CJK 字符约 1.5 字符/token。
+        """
+        ascii_chars = 0
+        cjk_chars = 0
+        other_chars = 0
+        for c in text:
+            cp = ord(c)
+            if cp < 128:
+                ascii_chars += 1
+            elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+                cjk_chars += 1
+            else:
+                other_chars += 1
+        return ascii_chars // 4 + int(cjk_chars / 1.5) + other_chars // 3
 
     def _split_by_file(self, diff_text: str) -> List[tuple[str, str]]:
         """将完整 Diff 按文件路径切分。"""

@@ -125,18 +125,38 @@ async def _preload_file_contexts(diff_text: str) -> Dict[str, str]:
     async def read_one(file_path: str) -> tuple[str, str]:
         lines = changed_lines.get(file_path, [])
         if lines:
-            # 围绕变更行读取上下文
-            center = sum(lines) // len(lines) if lines else 0
-            start = max(1, center - _CONTEXT_LINES // 2)
-            end = center + _CONTEXT_LINES // 2
-            try:
-                content = await read_file_context.ainvoke({
-                    "file_path": file_path,
-                    "start_line": start,
-                    "end_line": end,
-                })
-            except Exception:
-                content = await read_file_context.ainvoke({"file_path": file_path})
+            # 按连续行号分组为独立 hunk（间隔 > 20 行视为不同 hunk）
+            hunks = _group_into_hunks(lines, gap=20)
+            if len(hunks) == 1:
+                # 单 hunk：围绕变更区域读取
+                center = (hunks[0][0] + hunks[0][-1]) // 2
+                start = max(1, center - _CONTEXT_LINES // 2)
+                end = center + _CONTEXT_LINES // 2
+                try:
+                    content = await read_file_context.ainvoke({
+                        "file_path": file_path,
+                        "start_line": start,
+                        "end_line": end,
+                    })
+                except Exception:
+                    content = await read_file_context.ainvoke({"file_path": file_path})
+            else:
+                # 多 hunk：分别读取每个 hunk 的上下文
+                parts = []
+                for hunk in hunks:
+                    center = (hunk[0] + hunk[-1]) // 2
+                    start = max(1, center - _CONTEXT_LINES // 4)
+                    end = center + _CONTEXT_LINES // 4
+                    try:
+                        part = await read_file_context.ainvoke({
+                            "file_path": file_path,
+                            "start_line": start,
+                            "end_line": end,
+                        })
+                        parts.append(str(part))
+                    except Exception:
+                        pass
+                content = "\n...\n".join(parts) if parts else f"(无法读取 {file_path})"
         else:
             try:
                 content = await read_file_context.ainvoke({"file_path": file_path})
@@ -185,3 +205,20 @@ def _extract_changed_lines(diff_text: str) -> Dict[str, List[int]]:
             continue
 
     return result
+
+
+def _group_into_hunks(lines: List[int], gap: int = 20) -> List[List[int]]:
+    """将行号列表按连续性分组为独立 hunk。
+
+    例如 [100, 101, 102, 5000, 5001] 在 gap=20 时分为两个 hunk。
+    """
+    if not lines:
+        return []
+    sorted_lines = sorted(set(lines))
+    hunks: List[List[int]] = [[sorted_lines[0]]]
+    for line in sorted_lines[1:]:
+        if line - hunks[-1][-1] <= gap:
+            hunks[-1].append(line)
+        else:
+            hunks.append([line])
+    return hunks
