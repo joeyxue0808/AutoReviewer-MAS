@@ -1,6 +1,9 @@
 # Claude Code local guidance (never commit)
 CLAUDE.md
 
+# Internal design blueprint (not for public repo)
+AutoReviewer-MAS_Blueprint.md
+
 # IDE
 .idea/
 .vscode/
