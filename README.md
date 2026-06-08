@@ -75,7 +75,7 @@ __start__ → router_node → Send(reviewer_node) → fixer_node → critic_node
 ### Installation
 
 ```bash
-git clone https://github.com/your-org/AutoReviewer-MAS.git
+git clone https://github.com/joeyxue0808/AutoReviewer-MAS.git
 cd AutoReviewer-MAS
 pip install -r requirements.txt
 
@@ -85,6 +85,21 @@ cp config/settings.yaml.example config/settings.yaml
 ```
 
 ### Environment Variables
+
+Set environment variables **in the project root directory** before running. You can use a `.env` file or export directly:
+
+```bash
+# Option 1: Create .env file in project root
+cat > .env << 'EOF'
+MIMO_API_KEY=your-api-key-here
+GITHUB_TOKEN=your-github-token
+GITLAB_TOKEN=your-gitlab-token
+EOF
+
+# Option 2: Export in shell (must be in project directory)
+export MIMO_API_KEY=your-api-key-here
+export GITHUB_TOKEN=your-github-token
+```
 
 | Variable | Required | Description |
 |----------|----------|-------------|

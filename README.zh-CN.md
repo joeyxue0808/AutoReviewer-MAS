@@ -83,7 +83,7 @@ __start__ → router_node → Send(reviewer_node) → fixer_node → critic_node
 ### 安装
 
 ```bash
-git clone https://github.com/your-org/AutoReviewer-MAS.git
+git clone https://github.com/joeyxue0808/AutoReviewer-MAS.git
 cd AutoReviewer-MAS
 pip install -r requirements.txt
 
@@ -93,6 +93,21 @@ cp config/settings.yaml.example config/settings.yaml
 ```
 
 ### 环境变量
+
+在项目根目录下设置环境变量后才能正常运行。推荐使用 `.env` 文件或直接 export：
+
+```bash
+# 方式一：在项目根目录创建 .env 文件
+cat > .env << 'EOF'
+MIMO_API_KEY=你的API密钥
+GITHUB_TOKEN=你的GitHub Token
+GITLAB_TOKEN=你的GitLab Token
+EOF
+
+# 方式二：在 shell 中 export（需在项目目录下执行）
+export MIMO_API_KEY=你的API密钥
+export GITHUB_TOKEN=你的GitHub Token
+```
 
 | 变量 | 必需 | 说明 |
 |------|------|------|
