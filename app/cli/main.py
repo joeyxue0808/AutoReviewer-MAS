@@ -74,8 +74,8 @@ def _get_git_diff(mode: str = "working") -> str:
     if mode == "staged":
         cmd = ["git", "diff", "--cached"]
     elif mode == "working":
-        # HEAD.. 工作区 = 已暂存 + 未暂存的全部变更
-        # 对于新仓库（无 commit），用 git diff
+        # 已暂存 + 未暂存的全部变更
+        # 先尝试 git diff HEAD，失败则回退到 git diff（新仓库无 commit 时）
         cmd = ["git", "diff", "HEAD"]
     elif mode.startswith("branch:"):
         branch = mode.split(":", 1)[1]
@@ -92,9 +92,21 @@ def _get_git_diff(mode: str = "working") -> str:
     try:
         result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", check=True)
         return result.stdout
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Git diff 失败: {e.stderr}[/red]")
+    except subprocess.CalledProcessError:
+        if mode == "working":
+            # 无 commit 的新仓库：git diff HEAD 失败，合并 staged + unstaged
+            return _run_git(["git", "diff", "--cached"]) + "\n" + _run_git(["git", "diff"])
+        console.print("[red]Git diff 失败[/red]")
         raise typer.Exit(1)
+
+
+def _run_git(cmd: list[str]) -> str:
+    """执行 git 命令，返回 stdout。"""
+    try:
+        result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", check=True)
+        return result.stdout
+    except subprocess.CalledProcessError:
+        return ""
 
 
 def _get_full_scan_diff(repo_root: str) -> str:
@@ -135,7 +147,14 @@ def _get_full_scan_diff(repo_root: str) -> str:
 
         rel_str = str(rel).replace("\\", "/")
         lines = content.splitlines()
-        diff_header = f"diff --git /dev/null b/{rel_str}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel_str}\n@@ -0,0 +1,{len(lines)} @@\n"
+        # 必须用 a/xxx b/xxx 格式，否则 DiffAnalyzer 的正则无法匹配
+        diff_header = (
+            f"diff --git a/{rel_str} b/{rel_str}\n"
+            f"new file mode 100644\n"
+            f"--- /dev/null\n"
+            f"+++ b/{rel_str}\n"
+            f"@@ -0,0 +1,{len(lines)} @@\n"
+        )
         diff_body = "\n".join(f"+{line}" for line in lines)
         parts.append(diff_header + diff_body + "\n")
 
