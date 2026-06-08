@@ -1,0 +1,10 @@
+{
+  "blocks": [
+    {
+      "file_path": "cmd/server/main.go",
+      "search": "    http.HandleFunc(\"/\", handler)\n    http.ListenAndServe(\":8080\", nil)",
+      "replace": "    http.HandleFunc(\"/\", handler)\n    if err := http.ListenAndServe(\":8080\", nil); err != nil {\n        slog.Error(\"server failed\", \"error\", err)\n        os.Exit(1)\n    }"
+    }
+  ],
+  "explanation": "将 ListenAndServe 的返回值用 log 包裹，启动失败时记录错误并退出"
+}

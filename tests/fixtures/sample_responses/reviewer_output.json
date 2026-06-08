@@ -1,0 +1,13 @@
+{
+  "issues": [
+    {
+      "file_path": "cmd/server/main.go",
+      "line_number": 13,
+      "severity": "warning",
+      "category": "error_handling",
+      "description": "http.ListenAndServe 的返回值未处理，服务器启动失败时无法感知",
+      "suggestion": "使用 log.Fatal(http.ListenAndServe(\":8080\", nil)) 包裹，启动失败时立即退出"
+    }
+  ],
+  "is_approved": false
+}
