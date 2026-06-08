@@ -138,9 +138,24 @@ pip install -e .
 
 # 然后在任意项目目录下直接使用：
 cd /path/to/your-project
-python -m app.cli.main local          # 审查当前分支
-python -m app.cli.main local --all    # 审查所有变更
-python -m app.cli.main local --branch feature/auth  # 指定分支
+
+# 审查工作区全部变更（暂存+未暂存，默认模式）
+python -m app.cli.main local
+
+# 仅审查暂存区
+python -m app.cli.main local --staged
+
+# 与指定分支对比
+python -m app.cli.main local --branch feature/auth
+
+# 审查某个 commit 的变更
+python -m app.cli.main local --commit abc1234
+
+# 审查 commit 范围的变更（多提交）
+python -m app.cli.main local --range abc1234..def5678
+
+# 全量扫描整个代码库
+python -m app.cli.main local --full
 ```
 
 **方式二 — 设置 PYTHONPATH 环境变量：**

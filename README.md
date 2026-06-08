@@ -133,9 +133,24 @@ pip install -e .
 
 # Then in ANY project directory:
 cd /path/to/your-project
+
+# Review all working tree changes (staged + unstaged, default)
 python -m app.cli.main local
-python -m app.cli.main local --all
+
+# Review only staged changes
+python -m app.cli.main local --staged
+
+# Review diff against another branch
 python -m app.cli.main local --branch feature/auth
+
+# Review a specific commit
+python -m app.cli.main local --commit abc1234
+
+# Review a range of commits
+python -m app.cli.main local --range abc1234..def5678
+
+# Full codebase scan (all source files)
+python -m app.cli.main local --full
 ```
 
 **Option B — Set PYTHONPATH:**

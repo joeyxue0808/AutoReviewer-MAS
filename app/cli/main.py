@@ -57,22 +57,89 @@ def _setup_logging(verbose: bool = False) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def _get_git_diff(staged: bool = True) -> str:
-    """获取本地 Git Diff。
+def _get_git_diff(mode: str = "working") -> str:
+    """获取 Git Diff。
 
     Args:
-        staged: True 获取暂存区 diff (--cached)，False 获取工作区 diff
+        mode: diff 模式
+            - "working": 工作区全部变更（暂存+未暂存），默认
+            - "staged": 仅暂存区变更
+            - "branch:<name>": 当前分支与指定分支的差异
+            - "commit:<sha>": 指定 commit 的变更
+            - "range:<sha1>..<sha2>": commit 范围的变更
 
     Returns:
         diff 文本
     """
-    cmd = ["git", "diff", "--cached"] if staged else ["git", "diff"]
+    if mode == "staged":
+        cmd = ["git", "diff", "--cached"]
+    elif mode == "working":
+        # HEAD.. 工作区 = 已暂存 + 未暂存的全部变更
+        # 对于新仓库（无 commit），用 git diff
+        cmd = ["git", "diff", "HEAD"]
+    elif mode.startswith("branch:"):
+        branch = mode.split(":", 1)[1]
+        cmd = ["git", "diff", f"{branch}...HEAD"]
+    elif mode.startswith("commit:"):
+        sha = mode.split(":", 1)[1]
+        cmd = ["git", "diff", f"{sha}~1", sha]
+    elif mode.startswith("range:"):
+        range_str = mode.split(":", 1)[1]
+        cmd = ["git", "diff", range_str]
+    else:
+        cmd = ["git", "diff"]
+
     try:
         result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", check=True)
         return result.stdout
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Git diff 失败: {e.stderr}[/red]")
         raise typer.Exit(1)
+
+
+def _get_full_scan_diff(repo_root: str) -> str:
+    """生成全量扫描的合成 diff。
+
+    将仓库中所有源文件视为新增文件（diff against /dev/null），
+    使 DiffAnalyzer 能像处理正常 diff 一样处理全量扫描。
+    """
+    from pathlib import Path
+
+    _SOURCE_SUFFIXES = {
+        ".go", ".py", ".cpp", ".cc", ".h", ".hpp", ".java",
+        ".vue", ".js", ".cjs", ".mjs", ".ts", ".tsx", ".dart", ".cs",
+    }
+    _SKIP_DIRS = {
+        "node_modules", "vendor", "__pycache__", ".git", "dist", "build",
+        ".venv", "venv", "env", ".tox", ".mypy_cache", ".lancedb",
+        "tests", "test",
+    }
+
+    parts = []
+    root = Path(repo_root)
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix not in _SOURCE_SUFFIXES:
+            continue
+        # 跳过指定目录
+        rel = path.relative_to(root)
+        if any(part in _SKIP_DIRS for part in rel.parts):
+            continue
+
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        rel_str = str(rel).replace("\\", "/")
+        lines = content.splitlines()
+        diff_header = f"diff --git /dev/null b/{rel_str}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel_str}\n@@ -0,0 +1,{len(lines)} @@\n"
+        diff_body = "\n".join(f"+{line}" for line in lines)
+        parts.append(diff_header + diff_body + "\n")
+
+    return "\n".join(parts)
 
 
 def _get_git_branch() -> str:
@@ -101,29 +168,59 @@ def _get_repo_root() -> str:
 
 @app.command()
 def local(
-    staged: bool = typer.Option(True, "--staged/--all", help="审查暂存区 (--staged) 或全部变更 (--all)"),
-    branch: str = typer.Option(None, "--branch", "-b", help="指定分支名（默认当前分支）"),
+    staged: bool = typer.Option(False, "--staged/--all", help="仅审查暂存区 (--staged) 或全部变更 (--all，默认)"),
+    branch: str = typer.Option(None, "--branch", "-b", help="与指定分支对比差异"),
+    commit: str = typer.Option(None, "--commit", "-c", help="审查指定 commit 的变更 (SHA)"),
+    range: str = typer.Option(None, "--range", "-r", help="审查 commit 范围 (如 abc123..def456)"),
+    full: bool = typer.Option(False, "--full", "-f", help="全量扫描（审查整个代码库，非增量）"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ):
-    """🔍 审查本地 Git 变更（绕过 Webhook，直接调用 Graph）。"""
+    """🔍 审查本地代码变更。
+
+    支持多种审查模式：
+    \b
+    默认        审查工作区全部变更（暂存+未暂存）
+    --staged    仅审查暂存区
+    --branch    与指定分支对比
+    --commit    审查某个 commit 的变更
+    --range     审查 commit 范围的变更
+    --full      全量扫描整个代码库
+    """
     _setup_logging(verbose)
 
     # 显示 Banner
     console.print(Panel.fit(
         "[bold cyan]🤖 AutoReviewer-MAS[/bold cyan]\n"
-        "[dim]本地伴随代码审查 - Phase 4 CLI[/dim]",
+        "[dim]本地伴随代码审查[/dim]",
         border_style="cyan",
     ))
 
     # 获取 Git 信息
     repo_root = _get_repo_root()
     current_branch = branch or _get_git_branch()
-    diff_text = _get_git_diff(staged=staged)
+
+    # 确定 diff 模式
+    if full:
+        diff_text = _get_full_scan_diff(repo_root)
+    elif commit:
+        diff_text = _get_git_diff(mode=f"commit:{commit}")
+        current_branch = f"commit-{commit[:8]}"
+    elif range:
+        diff_text = _get_git_diff(mode=f"range:{range}")
+        current_branch = f"range-{range[:16]}"
+    elif branch:
+        diff_text = _get_git_diff(mode=f"branch:{branch}")
+    elif staged:
+        diff_text = _get_git_diff(mode="staged")
+    else:
+        diff_text = _get_git_diff(mode="working")
 
     if not diff_text.strip():
         console.print("[yellow]⚠️  没有检测到代码变更[/yellow]")
         if staged:
-            console.print("[dim]提示: 使用 --all 审查工作区变更，或先 git add 暂存文件[/dim]")
+            console.print("[dim]提示: 默认模式已审查全部变更，--staged 仅审查暂存区[/dim]")
+        elif not full:
+            console.print("[dim]提示: 使用 --full 进行全量代码扫描[/dim]")
         raise typer.Exit(0)
 
     # 显示变更概览
