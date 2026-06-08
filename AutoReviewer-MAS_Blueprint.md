@@ -1,170 +1,152 @@
-# AutoReviewer-MAS 核心技术规格说明书 (Master Blueprint)
+# AutoReviewer-MAS V3.0: 轻量级架构演进与能力补全技术蓝图
 
-## 1. 核心目录与文件树定义 (严格遵循)
-```text
-AutoReviewer-MAS/
-├── app/
-│   ├── api/
-│   │   └── webhook.py          # 暴露 /api/v1/webhook/gitlab 接口
-│   ├── core/
-│   │   ├── config.py           # Pydantic Settings 全局配置加载
-│   │   └── llm_factory.py      # 返回 LangChain BaseChatModel 的工厂
-│   ├── schemas/
-│   │   ├── state.py            # LangGraph 的 TypedDict 状态定义
-│   │   ├── gitlab.py           # GitLab Webhook Payload 模型
-│   │   └── llm_out.py          # 约束大模型输出的 Pydantic V2 模型
-│   ├── agents/
-│   │   ├── workflow.py         # StateGraph 编译与流转逻辑
-│   │   ├── nodes/              # 各个节点的具体实现
-│   │   │   ├── reviewer.py
-│   │   │   ├── fixer.py
-│   │   │   └── tester.py
-│   │   └── prompts/            # 存放 System Prompts
-│   ├── sandbox/
-│   │   ├── base.py             # BaseSandboxEngine 抽象类
-│   │   ├── docker_engine.py    # 基于 docker-py 的实现
-│   │   └── shell_engine.py     # 基于本地 asyncio shell 的实现
-│   └── gitlab/
-│       └── client.py           # GitLab API 异步封装 (获取Diff/发评论)
-├── config/
-│   └── settings.yaml           # LLM 路由与沙盒策略配置
-├── main.py                     # FastAPI 启动入口
-└── requirements.txt
-```
-
-## 2. 核心数据结构契约 (Data Contracts)
-为了保证 LangGraph 各个节点的数据不畸变，必须严格按照以下模型定义：
-
-### 2.1 LangGraph 状态机定义 (app/schemas/state.py)
-Python
-from typing import TypedDict, List, Optional, Dict
-from pydantic import BaseModel
-
-class ReviewIssue(BaseModel):
-    file_path: str
-    line_number: int
-    severity: str  # enum: "info", "warning", "critical"
-    description: str
-    suggestion: str
-
-class ReviewState(TypedDict):
-    mr_id: int
-    project_id: int
-    source_branch: str
-    target_branch: str
-    diff_content: str               # 原始的 git diff 内容
-    language: str                   # 识别出的主要语言 (go, python等)
-    static_lint_logs: str           # 静态分析器输出的原始日志
-    review_issues: List[ReviewIssue]# Reviewer Agent 发现的问题
-    generated_patches: Dict[str, str] # Fixer 生成的代码补丁 (key: file_path, value: patch_content)
-    test_logs: str                  # Tester 沙盒执行后的日志
-    is_test_passed: bool            # 测试是否通过
-    retry_count: int                # Fixer <-> Tester 的循环重试次数
-### 2.2 大模型强约束输出定义 (app/schemas/llm_out.py)
-利用 LangChain 的 .with_structured_output() 方法，强制 LLM 返回 JSON。
-
-Python
-from pydantic import BaseModel, Field
-from typing import List
-
-class ReviewerOutput(BaseModel):
-    issues: List['ReviewIssue'] = Field(description="发现的代码缺陷列表")
-    is_approved: bool = Field(description="如果没有发现 critical 级别问题，则为 True")
-
-class FixerOutput(BaseModel):
-    file_path: str = Field(description="被修复的文件路径")
-    unified_diff: str = Field(description="严格标准的 Unified Diff 格式内容")
-## 3. LangGraph 节点与流转逻辑 (Node Definitions)
-Node 1: reviewer_node
-
-Input: ReviewState (读取 diff_content 和 static_lint_logs)
-
-LLM 角色: 高级架构师。根据语言特性（如 Go 查 goroutine 泄漏）审查代码。
-
-Output: 写入 review_issues。如果 is_approved 为 True，直接流转到 End。
-
-Node 2: fixer_node
-
-Input: ReviewState (读取 review_issues 和上一轮失败的 test_logs)
-
-LLM 角色: 重构工程师。必须输出严格的 Patch 文件内容。
-
-Output: 写入 generated_patches，递增 retry_count += 1。
-
-Node 3: tester_node
-
-Input: ReviewState (读取 generated_patches)
-
-逻辑: 调用 SandboxFactory，拉起隔离环境 -> 将 Patch 应用到源码 -> 执行对应语言的 test 命令。
-
-Output: 写入 test_logs 和 is_test_passed。
-
-Conditional Edge (条件路由):
-
-在 tester_node 之后：如果 is_test_passed == True 或者 retry_count >= 3，则流转到 submit_node（向 GitLab 提交评论）。如果 is_test_passed == False，流转回 fixer_node。
-
-## 4. 沙盒执行矩阵配置 (Sandbox Matrix)
-在 app/sandbox/docker_engine.py 中，必须硬编码或通过配置文件实现以下语言映射表：
-
-Go:
-
-Image: golang:1.23-alpine
-
-Test Command: go test ./... -v
-
-Lint Command: golangci-lint run
-
-Python:
-
-Image: python:3.12-slim
-
-Test Command: pytest --maxfail=1
-
-Lint Command: flake8 .
-
-## 5. 异常处理与降级策略 (Edge Cases & Fallbacks)
-LLM 速率限制 (Rate Limit): 在 core/llm_factory.py 中封装的 LLM 客户端必须接入 tenacity 库，实现 @retry(wait=wait_exponential(multiplier=1, min=2, max=10))。
-
-沙盒死循环防范 (Sandbox Timeout): 沙盒执行命令必须加上超时控制（如 asyncio.wait_for(process, timeout=300)），防止恶意代码或死锁导致沙盒假死。
-
-GitLab 异步解耦: Webhook 接收到请求后，必须立即返回 {"status": "processing"}，实际的 Graph 流转放在 FastAPI 的 BackgroundTasks 中执行。
-
+## 1. 演进愿景与核心目标
+在 V2.0 解决代码幻觉与沙盒安全的基础上，V3.0 致力于将 AutoReviewer-MAS 打造成**“开箱即用、低成本、高智能”**的轻量级审查中台。系统将彻底移除对重型中间件（Redis、PostgreSQL）的依赖，通过内嵌数据库实现持久化与向量检索；同时引入“主动纠错与猜测授权”机制，赋予 Agent 在容错场景下的自主探索能力。
 
 ---
 
-### 🚀 给 Claude Code 的究极提示词 (The Final Prompts)
+## 2. 核心架构“瘦身”与降本方案 (Lightweight Infrastructure)
 
-有了这份极其详细的 Blueprint，接下来让 Claude Code 执行的任务将变得非常清晰。请分三次发给 Claude Code：
+本章节改造必须完全兼容现有的 LangGraph 状态机拓扑与 FastAPI 异步入口。
 
-#### 第一步：基建与核心数据模型 (发给 Claude Code)
-```text
-# Context
-请读取我刚刚放在根目录的 `AutoReviewer-MAS_Blueprint.md` 文件，彻底理解项目的数据结构和架构规范。
+### 2.1 零外部依赖的持久化与队列
+*   **状态机 Checkpointer 降级**：废弃 `langgraph-checkpoint-postgres`。全面采用 `langgraph-checkpoint-sqlite`。在项目根目录生成 `state.db`，实现 Graph 状态的本地文件级持久化，足以支撑中小团队的并发 MR 审查。
+*   **内置异步任务队列**：移除 Redis Stream 依赖。在 `app/infra/worker.py` 中，使用 Python 原生的 `asyncio.Queue` 结合 FastAPI 的 `BackgroundTasks`。Webhook 接收 payload 后即刻压入内存队列，后台 Worker 协程循环消费，实现“零组件部署”的流量削峰。
 
-# Task 1: 核心基建搭建
-1. 根据文档第 1 节，创建所有的目录结构和空白文件。
-2. 根据文档第 2 节，在 `app/schemas/state.py` 和 `app/schemas/llm_out.py` 中精确实现 Pydantic 模型和 TypedDict。
-3. 创建 `config/settings.yaml`，并使用 pydantic-settings 在 `app/core/config.py` 中实现配置加载。
-4. 在 `app/core/llm_factory.py` 中实现一个函数 `get_llm(role: str)`，读取 yaml 配置并返回对应的 LangChain `ChatOpenAI` 实例（兼容 Mimo 网关和 vLLM），并使用 `tenacity` 库加上重试机制。
+### 2.2 渐进式沙盒 (Opt-in Sandbox)
+*   **自适应降级执行**：重构 `app/sandbox/factory.py`。系统启动时检测本地环境（是否有 Docker 进程/权限）。若无 Docker 依赖，系统将自动降级为“静态审查模式（Static Mode）”——仅流转 `reviewer_node` 和 `fixer_node`，跳过 `tester_node`，使项目可以被任意开发者 `git clone` 后在本地笔记本秒级启动。
 
-请严格遵照 Blueprint 中的契约进行代码生成。
-第二步：沙盒引擎与图节点 (发给 Claude Code)
-Plaintext
-# Context
-基于我们已建立的 schemas，现在开发执行层。
+### 2.3 LLM Prompt 缓存加速 (Prefix Caching)
+*   **API 成本压榨**：在 `app/core/llm_factory.py` 中，针对所有支持 Prefix Caching 的模型（如 Claude 3.5 Sonnet, vLLM 部署模型），在 System Prompt（包含公司规范、超大 Repo-Map）的组装处，添加 `{"type": "ephemeral"}` 缓存标记。只为 Diff 增量 token 付费，实现 50% 成本下降与 3 倍速度提升。
 
-# Task 2: 沙盒与 Agent 节点
-1. 参照 Blueprint 第 4 节，在 `app/sandbox/docker_engine.py` 中实现 `DockerSandbox` 类，需使用 `asyncio` 将 `docker-py` 的调用包装为非阻塞，并加入 300 秒超时控制（参考第 5 节）。
-2. 在 `app/agents/nodes/reviewer.py` 中，编写一个异步函数 `reviewer_node(state: ReviewState) -> dict`。使用 `.with_structured_output(ReviewerOutput)` 强制大模型输出 JSON，并返回更新后的字典以更新 Graph 状态。
-3. 同理，在 `app/agents/nodes/fixer.py` 实现 `fixer_node`（强制输出 FixerOutput）。
-4. 在 `app/agents/nodes/tester.py` 中实现 `tester_node`，解析 Patch，调用 Sandbox，提取并更新 `test_logs`。
-第三步：编排与 GitLab 闭环 (发给 Claude Code)
-Plaintext
-# Context
-最后，我们需要将孤立的节点串联，并接入 Webhook。
+---
 
-# Task 3: Graph 编排与 API
-1. 在 `app/agents/workflow.py` 中，初始化 `StateGraph(ReviewState)`。添加节点，并根据 Blueprint 第 3 节实现循环重试的 Conditional Edge。编译生成 `app_graph`。
-2. 在 `app/gitlab/client.py` 中，实现 `GitLabClient` 类（包含拉取 Diff 和发表 MR 评论的方法，请 mock 具体的网络请求细节或使用 python-gitlab）。
-3. 在 `app/api/webhook.py` 实现 FastAPI POST 接口，提取 GitLab webhook payload。使用 `BackgroundTasks` 异步执行 `app_graph.invoke()`，接口立即返回 HTTP 200。
-4. 完善 `main.py` 启动逻辑。
+## 3. 语义级全局检索补全 (Embedded Vector RAG)
+
+为解决大模型“仅看 Diff 导致全局逻辑断层”的劣势，V3.0 将在不增加运维负担的前提下引入本地化向量检索。
+
+### 3.1 Serverless 向量引擎 (LanceDB)
+*   **技术选型**：引入 `lancedb`。它无需独立部署容器，直接将向量索引以文件形式存储在本地 `.lancedb/` 目录下。
+*   **增量索引构建 (Indexer)**：新增 `app/rag/indexer.py`。当指定分支（如 `main`）发生 Merge 时，后台任务通过 `tree-sitter` 解析全量代码库及 Markdown 文档，切分为函数级 Chunk，调用轻量级 Embedding 模型（如 `BGE-m3`）存入 LanceDB。
+
+### 3.2 语义搜索 MCP 工具绑定
+*   **Agent 能力扩充**：在 `app/tools/` 目录下新增 `semantic_code_search(query: str, top_k: int = 3)` 工具。
+*   **兼容逻辑**：`reviewer_node` 和 `fixer_node` 通过 `bind_tools()` 获取此能力。当发现 Diff 中调用了不熟悉的内部函数，或涉及特定的业务词汇（如“支付防重”），Agent 可自主调用该工具，将 LanceDB 返回的相关源码上下文注入到当前的 reasoning loop（推理循环）中。
+
+---
+
+## 4. 主动探索与猜测授权机制 (Autonomous Exploration & HITL)
+
+彻底改变传统 Agent“遇到错误就崩溃”的刻板行为，实现基于人机对话（CLI / Webhook Comment）的柔性容错流转。
+
+### 4.1 异常捕获与意图推测 (ErrorRecoveryNode)
+*   **节点定义**：在 LangGraph 中新增 `error_recovery_node`。当 `tester_node`（沙盒执行错误，如找不到构建脚本）或 `fixer_node`（工具调用失败）抛出异常时，Graph 路由至此节点。
+*   **LLM 猜测逻辑**：传入异常堆栈与当前上下文，要求大模型输出包含推测选项的 JSON。
+    *   *数据结构更新 (`app/schemas/state.py`)*：在 `ReviewState` 中新增 `hitl_options: List[Dict[str, str]]` 字段。
+    *   *输出示例*：
+```json
+        [
+          {"id": "1", "action": "run_tool", "command": "npm run test", "desc": "尝试使用 npm 替代 yarn 执行单测"},
+          {"id": "2", "action": "skip_test", "command": "none", "desc": "跳过沙盒测试，直接提交当前重构代码"}
+        ]
+        ```
+
+### 4.2 全端人机交互中断 (Interrupt & Resume)
+*   **LangGraph 悬挂**：设置 `interrupt_before=["error_recovery_node"]`。
+*   **多渠道授权响应**：
+    *   **CLI 模式**：通过 `rich` 库在终端渲染交互式菜单，开发者按下对应数字键后，继续 Graph 流程。
+    *   **VCS 平台模式 (GitLab/GitHub)**：调用 VCS API 在当前 MR 下发表一条包含选项的评论。系统 Webhook 监听开发者的评论回复（如 `@bot 选 1`）。解析后，调用 Graph 的 `update_state(thread_id, {"selected_option": "1"})` 释放挂起状态，Agent 根据人类授权的意图继续自主探索。
+
+---
+
+## 5. 核心流转架构兼容确认 (Architecture Compatibility Checklist)
+
+以上 V3.0 的新增特性将与你原有的设计形成完美闭环：
+
+1.  **VCS 多态网关不变**：GitLab, GitHub 和 CLI 模式依旧共享同一个 Graph，仅在输入和人类交互的输出通道（Comment vs Terminal）上做差异化处理。
+2.  **9 大语言矩阵 (Language Matrix) 增强**：如果 `language_matrix` 中预设的 `test_command` 在特定项目中失效，将无缝触发 `ErrorRecoveryNode`，由 Agent 读取项目目录（如探测到 `pom.xml` 或 `Makefile`）后向人类提供新的编译命令选项。
+3.  **SearchReplaceBlock 核心不变**：Fixer 输出代码依然严格遵从“搜索/替换块”结构，确保大模型幻觉消除策略在轻量化版本中依旧生效。
+
+## 6. 实施路径建议
+供后续 Claude Code 辅助生成代码时的 Phase 拆解：
+*   **Sprint 1**: 移除 Redis/Postgres，完成 SQLite 与 BackgroundTasks 改造。
+*   **Sprint 2**: 接入 LanceDB，编写增量索引脚本与语义查询工具。
+*   **Sprint 3**: 实现 `ErrorRecoveryNode` 与跨平台的互动式授权流（HITL）。
+
+---
+
+## 7. 实施状态 (Implementation Status)
+
+> 本章节记录 V3.0 蓝图的实际开发进展，供团队参考。
+
+### Sprint 1: 安全加固 + 测试基础设施 ✅
+
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| 删除死代码 `app/gitlab/` | ✅ 完成 | 已被 `app/vcs/gitlab_client.py` 完全取代 |
+| ShellSandbox 路径穿越修复 | ✅ 完成 | `and` → `or` 逻辑修复，兼容 `/` 和 `\` 分隔符 |
+| 测试基础设施搭建 | ✅ 完成 | `tests/` 目录、`conftest.py`、`pytest.ini` |
+| Critic 单元测试 | ✅ 完成 | 8 个测试用例覆盖所有规则 |
+| DiffAnalyzer 单元测试 | ✅ 完成 | 语言检测、Chunk 拆分、token 估算 |
+| PatchApplier 单元测试 | ✅ 完成 | apply/try_apply、错误诊断 |
+| LanguageMatrix 单元测试 | ✅ 完成 | 9 语言后缀映射和配置查询 |
+
+### Sprint 2: RAG 语义检索 ✅
+
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| `app/rag/indexer.py` | ✅ 完成 | LanceDB 索引器，支持 AST 分块 + 行窗口降级 |
+| `app/tools/semantic_code_search.py` | ✅ 完成 | LangChain @tool，语义搜索代码库 |
+| 远程嵌入 API 支持 | ✅ 完成 | OpenAI-compatible embedding API |
+| 本地嵌入降级 | ✅ 完成 | sentence-transformers 可选 |
+| 随机向量降级 | ✅ 完成 | 开发测试用，无嵌入模型时可用 |
+
+### Sprint 3: 错误恢复 + 前缀缓存 ✅
+
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| `app/agents/nodes/error_recovery.py` | ✅ 完成 | 指数退避 + jitter，最大 30 秒等待 |
+| `ReviewState` 新增 `error_type`/`last_node` | ✅ 完成 | 错误类型和出错节点追踪 |
+| Reviewer/Fixer 错误类型标注 | ✅ 完成 | 429/timeout/connection 自动分类 |
+| Workflow 集成 error_recovery_node | ✅ 完成 | `_after_reviewer` 路由到 error_recovery |
+| Error recovery 单元测试 | ✅ 完成 | 错误次数上限和恢复逻辑 |
+| 前缀缓存 | ⏳ 待定 | 依赖 LLM Provider 支持，需实际 API 验证 |
+| Reviewer map-reduce 模式 | ⏳ 待定 | 已有 Send API 动态扇出，reduce 阶段待实现 |
+
+### Sprint 4: 零依赖模式 ✅
+
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| `app/infra/local_queue.py` | ✅ 完成 | asyncio.Queue 进程内队列 |
+| `app/infra/sqlite_checkpointer.py` | ✅ 完成 | SQLite + MemorySaver 降级 |
+| `app/sandbox/null_engine.py` | ✅ 完成 | 空沙箱，始终返回成功 |
+| `app/sandbox/factory.py` | ✅ 完成 | Docker → Shell → Null 自适应降级 |
+| `app/infra/queue.py` 工厂函数 | ✅ 完成 | `create_queue()` 根据配置选择队列 |
+| `app/infra/checkpointer.py` 降级 | ✅ 完成 | Postgres → SQLite → MemorySaver |
+| Worker 支持 local_mode | ✅ 完成 | 使用 `create_queue()` 替代硬编码 |
+| `settings.yaml.example` 更新 | ✅ 完成 | 新增 `local_mode` 配置段 |
+| Sandbox Factory 单元测试 | ✅ 完成 | NullSandbox 测试 |
+
+### Sprint 5: 可观测性 + 文档 ⏳
+
+| 任务 | 状态 | 说明 |
+|------|------|------|
+| `/health` 存活探针 | ✅ 完成 | 进程存活检查 |
+| `/ready` 就绪探针 | ✅ 完成 | 队列连通检查 |
+| 版本号更新 | ✅ 完成 | 0.4.0 → 0.5.0 |
+| README.md 更新 | ✅ 完成 | V3.0 功能说明 |
+| README.zh-CN.md 更新 | ✅ 完成 | 中文文档同步 |
+| CLAUDE.md 更新 | ✅ 完成 | 架构图、设计决策、测试指南 |
+| Blueprint 状态更新 | ✅ 完成 | 本章节 |
+| Langfuse 全链路追踪增强 | ⏳ 待定 | 需要实际 Langfuse 环境验证 |
+| structlog 结构化日志 | ⏳ 待定 | 可选依赖，不影响核心功能 |
+| docs/ 目录文档 | ⏳ 待定 | 部署/配置/开发/架构文档 |
+
+### 已实现但蓝图未规划的改动
+
+| 改动 | 说明 |
+|------|------|
+| `requirements.txt` 新增测试依赖 | pytest, pytest-asyncio, pytest-cov, httpx |
+| `requirements.txt` 新增 RAG 依赖 | lancedb |
+| `config/settings.yaml.example` 新增 RAG 配置 | embedding_model, embedding_api_base, db_path |
+| 集成测试 `test_workflow_graph.py` | Graph 拓扑、条件路由、报告格式化 |
