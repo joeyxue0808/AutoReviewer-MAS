@@ -182,6 +182,7 @@ pytest --cov=app --cov-report=term-missing
 - **Adaptive Sandbox**: Auto-degrades Docker → Shell → Null when engines are unavailable
 - **SQLite Checkpointer**: Zero-dependency state persistence alternative to Postgres
 - **Health/Readiness Probes**: `/health` and `/ready` endpoints for deployment monitoring
+- **Auto-Fix Write-Back**: Fixer patches are applied to source files on disk (with user confirmation)
 - **Test Suite**: Comprehensive unit and integration tests with pytest
 
 ### V2.0

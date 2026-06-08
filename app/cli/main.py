@@ -271,6 +271,11 @@ async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
     final_state["review_issues"] = issues  # 显示全部原始问题
     _display_results(final_state)
 
+    # ── 将修复写入磁盘 ──
+    blocks = final_state.get("search_replace_blocks", [])
+    if blocks:
+        _apply_blocks_to_files(blocks, repo_root)
+
 
 def _prompt_issue_selection(issues: list) -> list:
     """展示审查问题清单，让用户选择要修复的项。
@@ -338,6 +343,104 @@ def _prompt_issue_selection(issues: list) -> list:
         except ValueError:
             console.print("[yellow]⚠️  输入格式无效，跳过修复[/yellow]")
             return []
+
+
+def _apply_blocks_to_files(blocks: list, repo_root: str) -> None:
+    """将 Search/Replace Blocks 应用到磁盘上的源文件。
+
+    流程：读取源文件 → 展示变更预览 → 用户确认 → PatchApplier 写入
+    """
+    from pathlib import Path
+    from app.utils.patch_applier import PatchApplier
+
+    if not blocks:
+        return
+
+    # 收集需要读取的文件
+    files_to_read: set[str] = set()
+    for block in blocks:
+        fp = block.get("file_path", "")
+        if fp:
+            files_to_read.add(fp)
+
+    if not files_to_read:
+        return
+
+    # 读取源文件
+    source_files: dict[str, str] = {}
+    for fp in files_to_read:
+        full_path = Path(repo_root) / fp
+        if full_path.exists():
+            try:
+                source_files[fp] = full_path.read_text(encoding="utf-8")
+            except Exception as e:
+                console.print(f"[yellow]⚠️  无法读取 {fp}: {e}[/yellow]")
+        else:
+            console.print(f"[yellow]⚠️  文件不存在: {fp}[/yellow]")
+
+    if not source_files:
+        console.print("[yellow]⚠️  无法读取任何源文件，跳过写入[/yellow]")
+        return
+
+    # 展示变更预览
+    console.print()
+    console.print(Panel(
+        f"[bold]📝 即将修改 {len(source_files)} 个文件（共 {len(blocks)} 个修改块）[/bold]",
+        border_style="cyan",
+    ))
+
+    for i, block in enumerate(blocks, 1):
+        fp = block.get("file_path", "")
+        search = block.get("search_block", block.get("search", ""))
+        replace = block.get("replace_block", block.get("replace", ""))
+
+        diff_lines = [f"--- a/{fp}", f"+++ b/{fp}", ""]
+        for line in search.splitlines():
+            diff_lines.append(f"[red]- {line}[/red]")
+        diff_lines.append("")
+        for line in replace.splitlines():
+            diff_lines.append(f"[green]+ {line}[/green]")
+
+        console.print(Panel(
+            "\n".join(diff_lines),
+            title=f"[cyan]Block #{i}[/cyan] — [dim]{fp}[/dim]",
+            border_style="bright_black",
+            padding=(0, 1),
+        ))
+
+    # 用户确认
+    console.print()
+    confirm = console.input("[bold green]确认写入以上修改？(y/N) > [/bold green]").strip().lower()
+    if confirm != "y":
+        console.print("[yellow]⏭️  已跳过文件写入[/yellow]")
+        return
+
+    # 应用 patches
+    applier = PatchApplier()
+    try:
+        modified = applier.apply(source_files, blocks)
+    except Exception as e:
+        console.print(f"[red]❌ Patch 应用失败: {e}[/red]")
+        return
+
+    # 写回磁盘
+    written = 0
+    for fp, content in modified.items():
+        if content != source_files.get(fp):
+            full_path = Path(repo_root) / fp
+            try:
+                full_path.write_text(content, encoding="utf-8")
+                written += 1
+                console.print(f"  [green]✓[/green] {fp}")
+            except Exception as e:
+                console.print(f"  [red]✗[/red] {fp}: {e}")
+
+    console.print()
+    console.print(Panel(
+        f"[bold green]✅ 已写入 {written} 个文件的修改[/bold green]",
+        border_style="green",
+        padding=(0, 2),
+    ))
 
 
 def _display_results(state: dict) -> None:

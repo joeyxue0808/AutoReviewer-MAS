@@ -186,6 +186,7 @@ pytest --cov=app --cov-report=term-missing
 - **自适应沙箱**：Docker → Shell → Null 自动降级
 - **SQLite Checkpointer**：零依赖的状态持久化替代 Postgres
 - **健康检查端点**：`/health` 存活探针 + `/ready` 就绪探针
+- **修复写入磁盘**：Fixer 生成的修改经用户确认后直接写入源文件
 - **测试套件**：完善的单元测试和集成测试
 
 ### V2.0
