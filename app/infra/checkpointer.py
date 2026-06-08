@@ -18,17 +18,26 @@ _postgres_saver = None
 
 
 def get_checkpointer():
-    """获取 Postgres Checkpointer 实例。
+    """获取 Checkpointer 实例。
 
-    如果 checkpointer 未启用，返回 None（LangGraph 将使用内存模式）。
+    降级策略：Postgres → SQLite → MemorySaver → None
 
     Returns:
-        PostgresSaver 实例或 None
+        checkpointer 实例或 None
     """
+    # 检查 local_mode 配置
+    local_mode = getattr(settings, "local_mode", None)
+    if local_mode and getattr(local_mode, "enabled", False):
+        cp_type = getattr(local_mode, "checkpointer", "sqlite")
+        if cp_type == "sqlite":
+            return _get_sqlite_checkpointer()
+        return None
+
     if not settings.checkpointer.enabled:
         logger.info("Checkpointer 未启用，使用内存模式")
         return None
 
+    # 尝试 Postgres
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -39,12 +48,29 @@ def get_checkpointer():
         return saver
     except ImportError:
         logger.warning(
-            "langgraph-checkpoint-postgres 未安装，降级为内存模式。"
-            "请执行: pip install langgraph-checkpoint-postgres psycopg[binary]"
+            "langgraph-checkpoint-postgres 未安装，尝试 SQLite 降级"
         )
-        return None
+        return _get_sqlite_checkpointer()
     except Exception as e:
-        logger.error("Postgres Checkpointer 初始化失败: %s，降级为内存模式", e)
+        logger.error("Postgres Checkpointer 初始化失败: %s，尝试 SQLite 降级", e)
+        return _get_sqlite_checkpointer()
+
+
+def _get_sqlite_checkpointer():
+    """获取 SQLite checkpointer（零依赖降级方案）。"""
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        logger.info("使用 SQLite Checkpointer")
+        return SqliteSaver.from_conn_string("autoreviewer_checkpoints.db")
+    except ImportError:
+        pass
+
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+        logger.info("SQLite 不可用，降级为 MemorySaver（重启丢失状态）")
+        return MemorySaver()
+    except ImportError:
+        logger.warning("无可用的 checkpointer")
         return None
 
 

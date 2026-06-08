@@ -16,7 +16,7 @@ from typing import Any, Dict
 from app.agents.workflow import compile_graph
 from app.core.config import settings
 from app.infra.checkpointer import get_checkpointer
-from app.infra.queue import ReviewQueue, review_queue
+from app.infra.queue import ReviewQueue, review_queue, create_queue
 from app.schemas.state import ReviewState
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ def _setup_logging() -> None:
     )
 
 
-async def _process_task(task: Dict[str, Any], graph) -> None:
+async def _process_task(task: Dict[str, Any], graph, queue=None) -> None:
     """处理单个审查任务。
 
     Phase 4 HITL：Graph 在 submit_node 前挂起时，检测高危操作并发送审批通知。
@@ -57,6 +57,7 @@ async def _process_task(task: Dict[str, Any], graph) -> None:
             "vcs_provider": task.get("vcs_provider", "gitlab"),
             "pr_id": task.get("pr_id", ""),
             "trigger_type": task.get("trigger_type", "webhook_pr"),
+            "repo_id": task.get("repo_id", ""),
             "repo_context": task.get("repo_context", ""),
             "diff_chunks": task.get("diff_chunks", {}),
             "detected_languages": task.get("detected_languages", []),
@@ -65,6 +66,9 @@ async def _process_task(task: Dict[str, Any], graph) -> None:
             "test_logs": "",
             "is_test_passed": False,
             "retry_count": 0,
+            "error_count": 0,
+            "error_type": "",
+            "last_node": "",
         }
 
         config = {"configurable": {"thread_id": thread_id}}
@@ -114,7 +118,8 @@ async def _process_task(task: Dict[str, Any], graph) -> None:
             )
 
         # ACK 消息（无论是否挂起都 ACK，因为状态已持久化到 checkpointer）
-        await review_queue.ack(message_id)
+        ack_queue = queue or review_queue
+        await ack_queue.ack(message_id)
 
     except Exception as e:
         logger.error(
@@ -123,18 +128,19 @@ async def _process_task(task: Dict[str, Any], graph) -> None:
         )
 
 
-async def _run_worker_loop(graph) -> None:
+async def _run_worker_loop(graph, queue=None) -> None:
     """Worker 主循环：持续消费队列。"""
     logger.info("Worker 主循环启动，等待任务...")
+    use_queue = queue or review_queue
 
     while not _shutdown.is_set():
         try:
-            tasks = await review_queue.consume(count=1, block_ms=5000)
+            tasks = await use_queue.consume(count=1, block_ms=5000)
 
             for task in tasks:
                 if _shutdown.is_set():
                     break
-                await _process_task(task, graph)
+                await _process_task(task, graph, queue=use_queue)
 
         except asyncio.CancelledError:
             break
@@ -160,9 +166,10 @@ async def main():
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda s, f: _shutdown.set())
 
-    # 连接队列
-    await review_queue.connect()
-    logger.info("已连接 Redis 队列: %s", settings.queue.redis_url)
+    # 连接队列（根据配置选择 Redis 或内存队列）
+    queue = create_queue()
+    await queue.connect()
+    logger.info("消息队列已连接")
 
     # 初始化 Checkpointer
     checkpointer_ctx = get_checkpointer()
@@ -176,17 +183,17 @@ async def main():
             # 构建 Graph（带 checkpointer）并在其生命周期内运行
             graph = compile_graph(checkpointer=checkpointer)
             try:
-                await _run_worker_loop(graph)
+                await _run_worker_loop(graph, queue=queue)
             finally:
-                await review_queue.close()
+                await queue.close()
                 logger.info("Worker 已关闭")
     else:
         # 无 checkpointer 模式
         graph = compile_graph()
         try:
-            await _run_worker_loop(graph)
+            await _run_worker_loop(graph, queue=queue)
         finally:
-            await review_queue.close()
+            await queue.close()
             logger.info("Worker 已关闭")
 
 

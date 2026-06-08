@@ -126,3 +126,17 @@ class ReviewQueue:
 
 # 全局单例
 review_queue = ReviewQueue()
+
+
+def create_queue():
+    """工厂函数：根据配置返回合适的队列实例。
+
+    local_mode.enabled = true 时返回 LocalQueue（内存），
+    否则返回 ReviewQueue（Redis Stream）。
+    """
+    local_mode = getattr(settings, "local_mode", None)
+    if local_mode and getattr(local_mode, "enabled", False):
+        from app.infra.local_queue import LocalQueue
+        logger.info("Local mode: 使用内存队列")
+        return LocalQueue()
+    return review_queue
