@@ -1,6 +1,7 @@
-"""FastAPI 启动入口 - Phase 1 生命周期管理。
+"""FastAPI 启动入口 - V3.0 生命周期管理。
 
-在 lifespan 中管理 Redis 队列连接和 Postgres Checkpointer 初始化。
+在 lifespan 中管理 Redis 队列连接和 Checkpointer 初始化。
+支持 local_mode 零依赖运行。
 """
 
 import logging
@@ -11,7 +12,6 @@ from fastapi import FastAPI
 
 from app.api.webhook import router as webhook_router
 from app.api.approval import router as approval_router
-from app.infra.queue import review_queue
 
 
 def _setup_logging() -> None:
@@ -33,31 +33,37 @@ def _setup_logging() -> None:
 async def lifespan(app: FastAPI):
     """应用生命周期管理。
 
-    启动时：连接 Redis 队列
-    关闭时：断开 Redis 队列
+    启动时：连接消息队列（Redis 或内存）
+    关闭时：断开连接
     """
     _setup_logging()
     logger = logging.getLogger(__name__)
-    logger.info("AutoReviewer-MAS 启动中...")
+    logger.info("AutoReviewer-MAS V3.0 启动中...")
 
-    # 连接消息队列
+    # 根据配置选择队列
+    from app.infra.queue import create_queue
+    queue = create_queue()
+
     try:
-        await review_queue.connect()
-        logger.info("Redis 消息队列已连接")
+        await queue.connect()
+        logger.info("消息队列已连接")
     except Exception as e:
-        logger.warning("Redis 队列连接失败（降级为无队列模式）: %s", e)
+        logger.warning("队列连接失败（降级为无队列模式）: %s", e)
+
+    # 存储 queue 到 app state 供 health 端点使用
+    app.state.queue = queue
 
     yield
 
     # 关闭连接
-    await review_queue.close()
+    await queue.close()
     logger.info("AutoReviewer-MAS 关闭")
 
 
 app = FastAPI(
     title="AutoReviewer-MAS",
     description="Multi-Agent System for Automated Code Review",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -68,10 +74,27 @@ app.include_router(approval_router)
 
 @app.get("/health")
 async def health_check() -> dict:
-    """健康检查端点。"""
-    pending = await review_queue.pending()
+    """存活探针 — 进程是否在运行。"""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def readiness_check() -> dict:
+    """就绪探针 — 队列是否连通。"""
+    queue = getattr(app.state, "queue", None)
+    pending = 0
+    queue_status = "disconnected"
+
+    if queue:
+        try:
+            pending = await queue.pending()
+            queue_status = "connected"
+        except Exception:
+            queue_status = "error"
+
     return {
         "status": "ok",
+        "queue": queue_status,
         "queue_pending": pending,
     }
 
