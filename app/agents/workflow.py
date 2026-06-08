@@ -363,7 +363,14 @@ def build_graph() -> StateGraph:
 
 
 def compile_graph(checkpointer=None, interrupt_before: list[str] | None = None):
-    """编译 Graph，可选注入 Checkpointer 和 HITL 中断点。"""
+    """编译 Graph，可选注入 Checkpointer 和 HITL 中断点。
+
+    默认中断点：
+    - fixer_node: 修复前需 Tech Lead 审批问题清单
+    - submit_node: 提交前需审批高危文件
+
+    CLI 模式传入 interrupt_before=[] 跳过所有审批。
+    """
     graph_builder = build_graph()
     kwargs: dict = {}
     if checkpointer:
@@ -371,7 +378,7 @@ def compile_graph(checkpointer=None, interrupt_before: list[str] | None = None):
     if interrupt_before is not None:
         kwargs["interrupt_before"] = interrupt_before
     else:
-        kwargs["interrupt_before"] = ["submit_node"]
+        kwargs["interrupt_before"] = ["fixer_node", "submit_node"]
     return graph_builder.compile(**kwargs)
 
 

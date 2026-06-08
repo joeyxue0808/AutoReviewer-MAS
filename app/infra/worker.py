@@ -38,12 +38,11 @@ def _setup_logging() -> None:
 async def _process_task(task: Dict[str, Any], graph, queue=None) -> None:
     """处理单个审查任务。
 
-    Phase 4 HITL：Graph 在 submit_node 前挂起时，检测高危操作并发送审批通知。
-    Tech Lead 审批后，通过 API 端点唤醒 Graph 继续执行。
+    HITL 两阶段审批：
+    1. Graph 在 fixer_node 前挂起 → 发送修复审批通知（含问题清单）
+    2. Graph 在 submit_node 前挂起 → 发送高危文件审批通知
 
-    Args:
-        task: 从队列消费到的任务（含 _message_id 和 ReviewState 字段）
-        graph: 编译后的 LangGraph 实例（含 interrupt_before=["submit_node"]）
+    Tech Lead 审批后，通过 API 端点唤醒 Graph 继续执行。
     """
     message_id = task.pop("_message_id", "")
     vcs_provider = task.get("vcs_provider", "?")
@@ -74,48 +73,75 @@ async def _process_task(task: Dict[str, Any], graph, queue=None) -> None:
         config = {"configurable": {"thread_id": thread_id}}
         final_state = await graph.ainvoke(initial_state, config=config)
 
-        # 检查是否被 HITL 挂起（Graph 返回时 submit_node 未执行）
-        # 当 Graph 在 interrupt_before 挂起时，ainvoke 会返回当前状态
         review_issues = final_state.get("review_issues", [])
         blocks = final_state.get("search_replace_blocks", [])
 
-        # Phase 4: 高危操作检测
-        from app.infra.hitl import detect_high_risk_operations, send_approval_notification
+        from app.infra.hitl import (
+            detect_high_risk_operations,
+            send_approval_notification,
+            send_fix_approval_notification,
+        )
         from app.api.approval import register_pending_approval
 
-        high_risks = detect_high_risk_operations(review_issues, blocks)
+        approval_url = f"http://localhost:8000/api/v1/approve/{thread_id}"
 
-        if high_risks:
-            # 注册待审批
+        # ── 判断挂起阶段 ──
+        if review_issues and not blocks:
+            # 阶段 1: 挂在 fixer_node 前（有审查问题但尚未修复）
+            logger.info(
+                "任务挂起等待修复审批: vcs=%s, pr=%s, issues=%d",
+                vcs_provider, pr_id, len(review_issues),
+            )
+
             register_pending_approval(
                 thread_id=thread_id,
                 pr_id=pr_id,
                 vcs_provider=vcs_provider,
-                high_risk_files=[m.file_path for m in high_risks],
+                high_risk_files=[i.get("file_path", "") for i in review_issues],
             )
 
-            # 发送审批通知
-            approval_url = f"http://localhost:8000/api/v1/approve/{thread_id}"
-            await send_approval_notification(
+            await send_fix_approval_notification(
                 pr_id=pr_id,
                 vcs_provider=vcs_provider,
-                high_risk_matches=high_risks,
+                review_issues=review_issues,
                 approval_url=approval_url,
             )
 
-            logger.info(
-                "任务挂起等待审批: vcs=%s, pr=%s, 高危文件=%s",
-                vcs_provider, pr_id, [m.file_path for m in high_risks],
-            )
+        elif blocks:
+            # 阶段 2: 挂在 submit_node 前（已有修复结果）
+            high_risks = detect_high_risk_operations(review_issues, blocks)
+
+            if high_risks:
+                register_pending_approval(
+                    thread_id=thread_id,
+                    pr_id=pr_id,
+                    vcs_provider=vcs_provider,
+                    high_risk_files=[m.file_path for m in high_risks],
+                )
+
+                await send_approval_notification(
+                    pr_id=pr_id,
+                    vcs_provider=vcs_provider,
+                    high_risk_matches=high_risks,
+                    approval_url=approval_url,
+                )
+
+                logger.info(
+                    "任务挂起等待高危审批: vcs=%s, pr=%s, 高危文件=%s",
+                    vcs_provider, pr_id, [m.file_path for m in high_risks],
+                )
+            else:
+                # 无高危操作，Graph 应已完成
+                logger.info(
+                    "任务完成: vcs=%s, pr=%s, issues=%d, passed=%s, retries=%d",
+                    vcs_provider, pr_id,
+                    len(review_issues),
+                    final_state.get("is_test_passed", False),
+                    final_state.get("retry_count", 0),
+                )
         else:
-            # 无高危操作，Graph 应已完成（submit_node 执行完毕）
-            logger.info(
-                "任务完成: vcs=%s, pr=%s, issues=%d, passed=%s, retries=%d",
-                vcs_provider, pr_id,
-                len(review_issues),
-                final_state.get("is_test_passed", False),
-                final_state.get("retry_count", 0),
-            )
+            # 无问题，审查直接通过
+            logger.info("任务完成（无问题）: vcs=%s, pr=%s", vcs_provider, pr_id)
 
         # ACK 消息（无论是否挂起都 ACK，因为状态已持久化到 checkpointer）
         ack_queue = queue or review_queue

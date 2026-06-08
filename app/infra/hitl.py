@@ -119,18 +119,7 @@ async def send_approval_notification(
     approval_url: str,
     webhook_url: str | None = None,
 ) -> bool:
-    """发送审批通知到飞书/钉钉。
-
-    Args:
-        pr_id: PR/MR ID
-        vcs_provider: VCS 平台
-        high_risk_matches: 高危操作列表
-        approval_url: 审批链接（点击后唤醒 Graph）
-        webhook_url: 飞书/钉钉 Webhook URL（从环境变量读取）
-
-    Returns:
-        是否发送成功
-    """
+    """发送高危文件审批通知到飞书/钉钉（submit 前）。"""
     import os
     import aiohttp
 
@@ -139,7 +128,6 @@ async def send_approval_notification(
         logger.warning("未配置审批 Webhook URL (APPROVAL_WEBHOOK_URL)，跳过通知")
         return False
 
-    # 构建卡片消息
     risk_files = "\n".join(f"- `{m.file_path}`" for m in high_risk_matches)
 
     card = {
@@ -181,6 +169,98 @@ async def send_approval_notification(
             ],
         },
     }
+
+    return await _send_card(url, card, pr_id)
+
+
+async def send_fix_approval_notification(
+    pr_id: str,
+    vcs_provider: str,
+    review_issues: list,
+    approval_url: str,
+    webhook_url: str | None = None,
+) -> bool:
+    """发送修复审批通知到飞书/钉钉（fixer 前）。
+
+    Reviewer 完成审查后，将问题清单发送给 Tech Lead 审批，
+    确认后 Fixer 才开始执行修复。
+    """
+    import os
+    import aiohttp
+
+    url = webhook_url or os.getenv("APPROVAL_WEBHOOK_URL", "")
+    if not url:
+        logger.warning("未配置审批 Webhook URL (APPROVAL_WEBHOOK_URL)，跳过通知")
+        return False
+
+    sev_icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
+
+    issue_lines = []
+    for i, issue in enumerate(review_issues, 1):
+        sev = issue.get("severity", "info")
+        fp = issue.get("file_path", "")
+        ln = issue.get("line_number", "")
+        desc = issue.get("description", "")
+        icon = sev_icon.get(sev, "•")
+        issue_lines.append(f"{i}. {icon} **[{sev.upper()}]** `{fp}:{ln}` — {desc}")
+
+    issues_text = "\n".join(issue_lines) if issue_lines else "（无问题）"
+    total = len(review_issues)
+    critical_count = sum(1 for i in review_issues if i.get("severity") == "critical")
+    warning_count = sum(1 for i in review_issues if i.get("severity") == "warning")
+
+    summary = f"共 {total} 个问题"
+    if critical_count:
+        summary += f"，其中 🔴 critical {critical_count} 个"
+    if warning_count:
+        summary += f"，🟡 warning {warning_count} 个"
+
+    card = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": "🔧 AutoReviewer 修复审批"},
+                "template": "orange",
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            f"**{vcs_provider.upper()} !{pr_id}** 审查完成，{summary}：\n\n"
+                            f"{issues_text}\n\n"
+                            f"请确认是否允许自动修复这些问题。"
+                        ),
+                    },
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "✅ 允许修复"},
+                            "type": "primary",
+                            "url": approval_url,
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "❌ 跳过修复"},
+                            "type": "danger",
+                            "url": approval_url + "?action=reject",
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+
+    return await _send_card(url, card, pr_id)
+
+
+async def _send_card(url: str, card: dict, pr_id: str) -> bool:
+    """发送卡片消息到飞书/钉钉 Webhook。"""
+    import aiohttp
 
     try:
         async with aiohttp.ClientSession() as session:
