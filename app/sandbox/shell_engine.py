@@ -42,8 +42,8 @@ class ShellSandbox(BaseSandboxEngine):
         try:
             # 写入源文件（带路径穿越防护）
             for file_path, content in source_files.items():
-                # 路径穿越防护：禁止 .. 组件
-                if ".." in file_path.split(os.sep) and ".." in file_path.split("/"):
+                # 路径穿越防护：禁止 .. 组件（兼容 / 和 \ 分隔符）
+                if ".." in file_path.split(os.sep) or ".." in file_path.split("/"):
                     logger.warning("拒绝路径穿越: %s", file_path)
                     continue
 
