@@ -474,8 +474,18 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
 
             progress.update(task, description="[green]✅ 修复完成[/green]")
 
-        # ── 将修复写入磁盘（自动模式，跳过确认） ──
+        # ── 诊断：fix graph 输出 ──
         blocks = final_state.get("search_replace_blocks", [])
+        test_logs = final_state.get("test_logs", "")
+        is_passed = final_state.get("is_test_passed", False)
+        retry_count = final_state.get("retry_count", 0)
+        console.print(f"[dim]  Fixer 输出: {len(blocks)} 个 block, 重试 {retry_count} 次, 测试通过={is_passed}[/dim]")
+        if test_logs and "Critic 拒绝" in test_logs:
+            console.print(f"[yellow]  ⚠️ Critic 拒绝了修复块[/yellow]")
+        if not blocks:
+            console.print("[yellow]  ⚠️ Fixer 未生成任何修复块，可能是 LLM 调用失败或问题无法自动修复[/yellow]")
+
+        # ── 将修复写入磁盘 ──
         if blocks:
             written = _apply_blocks_to_files(blocks, repo_root, auto_write=True)
             total_fixes_applied += written or 0
@@ -702,7 +712,14 @@ def _apply_blocks_to_files(blocks: list, repo_root: str, auto_write: bool = Fals
         modified = applier.apply(source_files, blocks)
     except Exception as e:
         console.print(f"[red]❌ Patch 应用失败: {e}[/red]")
-        return
+        # 降级：逐块尝试，记录哪些成功哪些失败
+        modified, results = applier.try_apply(source_files, blocks)
+        for r in results:
+            status = "[green]✓[/green]" if r.success else "[red]✗[/red]"
+            console.print(f"  {status} {r.file_path}: {r.error if r.error else 'OK'}")
+        if not any(r.success for r in results):
+            console.print("[red]  所有 patch 均失败，search 内容与源文件不匹配[/red]")
+            return 0
 
     # 写回磁盘
     written = 0
