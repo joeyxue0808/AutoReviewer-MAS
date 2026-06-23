@@ -112,11 +112,11 @@ class ReviewState(TypedDict):
     round_issues: Annotated[List[Dict[str, Any]], operator.add]  # 每轮发现的问题
 
     # ── 用户干预相关 ──
-    user_input_queue: Any  # 异步队列，用于接收用户输入
+    user_input_queue: Any  # 异步队列，类型应为 asyncio.Queue[UserInput]
     user_instructions: str  # 当前有效的用户指令
     user_decisions: Dict[str, bool]  # 用户对问题的决策
     pending_user_approval: bool  # 是否在等待用户批准
-    user_approval_result: Optional[bool]  # 用户批准结果
+    user_approval_result: Optional[bool]  # 用户批准结果: None 表示等待用户决定，True/False 表示用户已做出决定
 
     # ── 多轮结果追踪 ──
     fixed_issues: Annotated[List[Dict[str, Any]], operator.add]  # 已修复的问题

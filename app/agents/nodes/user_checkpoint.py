@@ -80,7 +80,11 @@ def user_checkpoint_node(state: ReviewState) -> Dict[str, Any]:
     elif isinstance(user_response, UserInput):
         parsed_input = user_response
     elif isinstance(user_response, dict) and "action" in user_response:
-        parsed_input = UserInput(**user_response)
+        try:
+            parsed_input = UserInput.model_validate(user_response)
+        except Exception as e:
+            logger.warning("用户输入验证失败: %s", e)
+            parsed_input = UserInput(action=UserActionType.APPROVE, timestamp=0)
     else:
         logger.warning("无法识别的用户输入: %s，使用默认批准", user_response)
         parsed_input = UserInput(action=UserActionType.APPROVE, timestamp=0)
@@ -340,12 +344,15 @@ def _extract_categories(text: str) -> list:
     text_lower = text.lower()
     
     for category, keywords in category_keywords.items():
+        # 跳过 "general" 类别，避免通用关键词干扰
+        if category == "general":
+            continue
         for keyword in keywords:
             if keyword in text_lower:
                 categories.append(category)
                 break
     
-    # 如果没有匹配到，返回默认类别
+    # 如果没有匹配到任何特定类别，返回默认类别 "general"
     if not categories:
         categories = ["general"]
     
@@ -393,10 +400,11 @@ def after_user_checkpoint(state: ReviewState) -> str:
     
     # 检查是否跳过当前轮次
     if "跳过" in user_instructions or "skip" in user_instructions.lower():
+        # 注意：current_round 在 decision_node 中递增，这里检查的是当前状态
         if current_round >= max_rounds:
             return "submit_node"
         else:
-            return "reviewer_node"  # 重新审查
+            return "reviewer_node"  # 重新审查（轮次递增将在 decision_node 中处理）
     
     # 默认继续修复
     if remaining_issues:

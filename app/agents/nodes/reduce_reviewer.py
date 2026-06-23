@@ -56,31 +56,41 @@ def reduce_reviewer_node(state: ReviewState) -> Dict[str, Any]:
             ln = getattr(issue, "line_number", 0)
             desc = getattr(issue, "description", "")
         
-        # 生成去重键
-        dedup_key = (fp, ln, desc[:100])  # 描述截断防止过长
+        # 生成去重键（使用完整描述，避免截断导致误判）
+        dedup_key = (fp, ln, desc)
         
         if dedup_key not in seen:
             seen.add(dedup_key)
             unique_issues.append(issue)
     
+    # 辅助函数：获取 issue 的 severity
+    def _get_severity(issue):
+        if isinstance(issue, dict):
+            return issue.get("severity", "info")
+        else:
+            return getattr(issue, "severity", "info")
+    
     # 按严重级别排序
     def sort_key(issue):
-        if isinstance(issue, dict):
-            severity = issue.get("severity", "info")
-        else:
-            severity = getattr(issue, "severity", "info")
+        severity = _get_severity(issue)
         return _SEVERITY_ORDER.get(severity, 99)
     
     sorted_issues = sorted(unique_issues, key=sort_key)
     
-    # 统计各级别数量
+    # 统计各级别数量（标准化 severity 到已知级别）
+    def _normalize_severity(severity):
+        """将 severity 标准化为已知的三种级别之一。"""
+        severity = severity.lower() if isinstance(severity, str) else "info"
+        if severity in _SEVERITY_ORDER:
+            return severity
+        # 未知 severity 归为 info
+        return "info"
+    
     severity_counts = {"critical": 0, "warning": 0, "info": 0}
     for issue in sorted_issues:
-        if isinstance(issue, dict):
-            severity = issue.get("severity", "info")
-        else:
-            severity = getattr(issue, "severity", "info")
-        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+        severity = _get_severity(issue)
+        normalized_severity = _normalize_severity(severity)
+        severity_counts[normalized_severity] += 1
     
     logger.info(
         "Reduce Reviewer: 去重后 %d 个问题 (critical=%d, warning=%d, info=%d)",

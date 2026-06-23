@@ -115,7 +115,7 @@ max_retry_count: 3
 # 多轮审查配置
 multiround:
   enabled: true            # 启用多轮审查
-  max_rounds: 3           # 最大审查轮次
+  max_rounds: 5           # 最大审查轮次
   auto_approve: false      # 是否自动批准修复（无需用户确认）
   convergence_threshold: 2 # 连续无新问题的轮次阈值，达到后自动停止
   user_input_timeout: 30   # 用户输入超时时间（秒）

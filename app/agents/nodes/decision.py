@@ -8,6 +8,7 @@
 """
 
 import logging
+import re
 import time
 from typing import Any, Dict, List
 
@@ -127,12 +128,12 @@ def _check_user_stop_command(instructions: str, current_round: int) -> str:
         if keyword in instructions_lower:
             return "stop"
     
-    # 检查轮次限制模式，如 "第3次修复后停止"
-    import re
-    stop_pattern = r"(\d+)\s*(次|轮|修复|重试).*停止"
-    match = re.search(stop_pattern, instructions_lower)
-    if match:
-        target_round = int(match.group(1))
+    # 检查轮次限制模式，如 "第3次修复后停止"，使用更精确的匹配
+    stop_pattern = r"(\d+)\s*(次|轮|修复|重试)\s*后?\s*停止"
+    matches = re.findall(stop_pattern, instructions_lower)
+    if matches:
+        # 取最后一个匹配的数字作为目标轮次
+        target_round = int(matches[-1][0])
         if current_round >= target_round:
             logger.info("用户指令: 达到第 %d 轮后停止", target_round)
             return "stop"

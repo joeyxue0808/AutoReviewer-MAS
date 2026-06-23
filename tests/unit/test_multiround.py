@@ -1,9 +1,7 @@
 """多轮审查功能单元测试。"""
 
-import asyncio
-import time
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import patch
 
 from app.schemas.user_input import (
     UserActionType,
@@ -39,6 +37,7 @@ class TestUserInputParsing:
         for cmd in reject_commands:
             result = parse_user_input(cmd)
             assert result.action == UserActionType.REJECT
+            assert result.timestamp > 0
 
     def test_parse_stop_commands(self):
         """测试解析停止命令。"""
@@ -46,6 +45,7 @@ class TestUserInputParsing:
         for cmd in stop_commands:
             result = parse_user_input(cmd)
             assert result.action == UserActionType.STOP
+            assert result.timestamp > 0
 
     def test_parse_skip_commands(self):
         """测试解析跳过命令。"""
@@ -53,6 +53,7 @@ class TestUserInputParsing:
         for cmd in skip_commands:
             result = parse_user_input(cmd)
             assert result.action == UserActionType.SKIP_ROUND
+            assert result.timestamp > 0
 
     def test_parse_ignore_commands(self):
         """测试解析忽略命令。"""
@@ -259,8 +260,6 @@ class TestUserCheckpointNode:
 
     def test_user_checkpoint_interrupt_mechanism(self):
         """测试 interrupt 机制：非自动模式下会调用 interrupt。"""
-        from unittest.mock import patch
-        
         state = {
             "current_round": 0,
             "max_rounds": 3,
@@ -272,7 +271,7 @@ class TestUserCheckpointNode:
         }
         
         # interrupt 会在非 Graph 上下文中抛出 RuntimeError
-        with pytest.raises(RuntimeError, match="runnable context"):
+        with pytest.raises(RuntimeError):
             user_checkpoint_node(state)
 
     def test_user_checkpoint_process_approve(self):

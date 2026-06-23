@@ -128,6 +128,16 @@ class CircuitBreakerConfig(BaseModel):
     exclude_exceptions: list[str] = Field(default_factory=lambda: ["ValueError", "KeyError"])
 
 
+class MultiroundConfig(BaseModel):
+    """多轮审查配置 (V4.0)。"""
+
+    enabled: bool = True
+    max_rounds: int = 5
+    auto_approve: bool = False
+    convergence_threshold: int = 2
+    user_input_timeout: int = 30
+
+
 class AppSettings(BaseSettings):
     """应用全局配置。"""
 
@@ -141,6 +151,9 @@ class AppSettings(BaseSettings):
     queue: QueueConfig = QueueConfig()
     checkpointer: CheckpointerConfig = CheckpointerConfig()
     circuit_breaker: CircuitBreakerConfig = CircuitBreakerConfig()
+
+    # V4.0
+    multiround: MultiroundConfig = MultiroundConfig()
 
     model_config = {"arbitrary_types_allowed": True}
 

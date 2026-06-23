@@ -413,15 +413,19 @@ app_graph = compile_graph()
 def build_review_only_graph() -> StateGraph:
     """构建仅包含审查阶段的子图。
 
-    拓扑：router → Send(reviewer) → END
+    拓扑：router → Send(reviewer) → reduce_reviewer → END
 
     用于 CLI 交互模式：先审查拿到问题清单，
     用户选择后再执行修复阶段。
     """
+    from app.agents.nodes.reduce_reviewer import reduce_reviewer_node
+
     graph = StateGraph(ReviewState)
     graph.add_node("reviewer_node", reviewer_node)
+    graph.add_node("reduce_reviewer_node", reduce_reviewer_node)
     graph.add_conditional_edges("__start__", router_node)
-    graph.add_edge("reviewer_node", END)
+    graph.add_edge("reviewer_node", "reduce_reviewer_node")
+    graph.add_edge("reduce_reviewer_node", END)
     return graph
 
 
