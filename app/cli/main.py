@@ -390,22 +390,28 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
             f"[bold]🔍 发现 {len(issues)} 个问题 — {' | '.join(badges)}[/bold]",
             border_style="blue",
         ))
-        console.print()
 
-        sev_style = {"critical": "bold red", "warning": "yellow", "info": "cyan"}
+        # 紧凑表格展示
         sev_icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
+        table = Table(show_lines=False, show_header=True, header_style="bold")
+        table.add_column("#", style="dim", width=4)
+        table.add_column("级别", width=8)
+        table.add_column("位置", style="cyan", min_width=30)
+        table.add_column("描述", ratio=1)
 
         for i, issue in enumerate(issues, 1):
             sev = issue.get("severity", "info")
             fp = issue.get("file_path", "")
             ln = issue.get("line_number", "")
             desc = issue.get("description", "")
-            sug = issue.get("suggestion", "")
             loc = f"{fp}:{ln}" if ln else fp
-            content = f"[{sev_style.get(sev, 'white')}]{sev_icon.get(sev, '•')} [{sev.upper()}][/] [cyan]{loc}[/cyan]\n\n{desc}"
-            if sug:
-                content += f"\n[green]💡 建议:[/green] {sug}"
-            console.print(Panel(content, title=f"[dim]#{i}[/dim]", border_style=sev_style.get(sev, "white"), padding=(0, 1)))
+            # 截断过长描述
+            if len(desc) > 100:
+                desc = desc[:97] + "..."
+            table.add_row(str(i), f"{sev_icon.get(sev, '•')} {sev}", loc, desc)
+
+        console.print(table)
+        console.print()
 
         # ── 用户决策：是否修复 ──
         has_fixable = severity_counts["critical"] > 0 or severity_counts["warning"] > 0

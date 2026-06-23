@@ -9,13 +9,13 @@ Reviewer 单次 LLM 调用完成审查，无需 ReAct 工具调用循环。
 
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agents.prompts.reviewer import REVIEWER_HUMAN_PROMPT, REVIEWER_SYSTEM_PROMPT
 from app.core.llm_factory import get_llm
-from app.schemas.llm_out import ReviewerOutput
+from app.schemas.llm_out import ReviewIssue, ReviewerOutput
 from app.schemas.state import ReviewState
 from app.tools import read_file_context
 
@@ -26,6 +26,40 @@ _DIFF_FILE_PATTERN = re.compile(r"^diff --git a/(.+?) b/(.+?)$", re.MULTILINE)
 
 # 每个文件读取的最大行数（围绕变更区域）
 _CONTEXT_LINES = 60
+
+
+def _try_parse_raw_json(error_str: str) -> Optional[ReviewerOutput]:
+    """从 LangChain 解析错误信息中提取原始 JSON 并手动解析。
+
+    当 with_structured_output(method="json_mode") 的解析器失败时，
+    错误信息中通常包含 LLM 返回的原始 JSON。尝试提取并解析。
+    """
+    import json
+
+    # 查找 JSON 起始位置
+    json_start = error_str.find('{"')
+    if json_start == -1:
+        json_start = error_str.find('{\n')
+    if json_start == -1:
+        return None
+
+    # 提取 JSON 字符串
+    json_str = error_str[json_start:]
+
+    # 尝试解析（逐步截短以处理截断情况）
+    for trim in range(0, min(200, len(json_str)), 5):
+        candidate = json_str[:len(json_str) - trim] if trim else json_str
+        try:
+            data = json.loads(candidate)
+            if "issues" in data:
+                return ReviewerOutput(
+                    issues=[ReviewIssue(**issue) for issue in data.get("issues", [])],
+                    is_approved=data.get("is_approved", True),
+                )
+        except (json.JSONDecodeError, Exception):
+            continue
+
+    return None
 
 
 async def reviewer_node(state: ReviewState) -> Dict[str, Any]:
@@ -84,20 +118,22 @@ async def reviewer_node(state: ReviewState) -> Dict[str, Any]:
         output: ReviewerOutput = await structured_llm.ainvoke([system_msg, human_msg])
     except Exception as e:
         error_str = str(e)
-        error_type = "unknown"
-        if "429" in error_str:
-            error_type = "429"
-        elif "timeout" in error_str.lower():
-            error_type = "timeout"
-        elif "connection" in error_str.lower():
-            error_type = "connection"
-        logger.error("Reviewer LLM 调用失败: %s (type=%s)", e, error_type)
-        # 不写入 error_type/last_node（并发 reviewer 会冲突）
-        # review-only graph 中无 error_recovery 节点，错误仅记录日志
-        return {
-            "review_issues": [],
-            "error_count": state.get("error_count", 0) + 1,
-        }
+        # 尝试从错误信息中提取原始 JSON 并手动解析（LangChain 解析失败降级）
+        output = _try_parse_raw_json(error_str)
+        if output is None:
+            error_type = "unknown"
+            if "429" in error_str:
+                error_type = "429"
+            elif "timeout" in error_str.lower():
+                error_type = "timeout"
+            elif "connection" in error_str.lower():
+                error_type = "connection"
+            logger.error("Reviewer LLM 调用失败: %s (type=%s)", e, error_type)
+            return {
+                "review_issues": [],
+                "error_count": state.get("error_count", 0) + 1,
+            }
+        logger.warning("LangChain 解析失败，已从原始输出中降级恢复 (%d 个问题)", len(output.issues))
 
     logger.info(
         "Reviewer 完成: 发现 %d 个问题, is_approved=%s",
