@@ -190,13 +190,14 @@ def local(
     staged: bool = typer.Option(False, "--staged/--all", help="仅审查暂存区 (--staged) 或全部变更 (--all，默认)"),
     branch: str = typer.Option(None, "--branch", "-b", help="与指定分支对比差异"),
     commit: str = typer.Option(None, "--commit", "-c", help="审查指定 commit 的变更 (SHA)"),
-    range: str = typer.Option(None, "--range", "-r", help="审查 commit 范围 (如 abc123..def456)"),
+    commit_range: str = typer.Option(None, "--range", "-r", help="审查 commit 范围 (如 abc123..def456)"),
     full: bool = typer.Option(False, "--full", "-f", help="全量扫描（审查整个代码库，非增量）"),
+    max_rounds: int = typer.Option(5, "--max-rounds", "-m", help="最大审查轮次（默认 5）"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ):
     """🔍 审查本地代码变更。
 
-    支持多种审查模式：
+    支持多种审查模式（自动多轮修复循环）：
     \b
     默认        审查工作区全部变更（暂存+未暂存）
     --staged    仅审查暂存区
@@ -204,13 +205,15 @@ def local(
     --commit    审查某个 commit 的变更
     --range     审查 commit 范围的变更
     --full      全量扫描整个代码库
+    -m/--max    最大审查轮次（默认 5）
     """
     _setup_logging(verbose)
 
     # 显示 Banner
     console.print(Panel.fit(
         "[bold cyan]🤖 AutoReviewer-MAS[/bold cyan]\n"
-        "[dim]本地伴随代码审查[/dim]",
+        "[dim]本地伴随代码审查 · 多轮自动修复[/dim]\n"
+        f"[dim]最大轮次: {max_rounds}[/dim]",
         border_style="cyan",
     ))
 
@@ -224,9 +227,9 @@ def local(
     elif commit:
         diff_text = _get_git_diff(mode=f"commit:{commit}")
         current_branch = f"commit-{commit[:8]}"
-    elif range:
-        diff_text = _get_git_diff(mode=f"range:{range}")
-        current_branch = f"range-{range[:16]}"
+    elif commit_range:
+        diff_text = _get_git_diff(mode=f"range:{commit_range}")
+        current_branch = f"range-{commit_range[:16]}"
     elif branch:
         diff_text = _get_git_diff(mode=f"branch:{branch}")
     elif staged:
@@ -247,7 +250,7 @@ def local(
 
     # 执行审查
     console.print()
-    asyncio.run(_run_review(diff_text, current_branch, repo_root))
+    asyncio.run(_run_review(diff_text, current_branch, repo_root, max_rounds=max_rounds))
 
 
 def _display_diff_summary(diff_text: str) -> None:
@@ -272,125 +275,258 @@ def _display_diff_summary(diff_text: str) -> None:
     console.print(f"[green]+{additions}[/green] / [red]-{deletions}[/red] 行")
 
 
-async def _run_review(diff_text: str, branch: str, repo_root: str) -> None:
-    """执行审查流水线 — 两阶段交互模式。
+async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: int = 3) -> None:
+    """执行审查流水线 — 多轮自动循环模式。
 
-    阶段 1: Reviewer 审查 → 展示问题清单 → 用户选择修复项
-    阶段 2: Fixer 修复 → Critic 校验 → Tester 测试 → 提交报告
+    流程：
+    1. Reviewer 审查 → 展示问题摘要
+    2. 用户选择: 修复全部 / 跳过
+    3. 如果用户选择修复：
+       a. Fixer 修复 → 写入磁盘
+       b. 重新获取最新 diff → 再次审查
+       c. 如果还有 critical 问题，继续修复
+       d. 循环直到没有 critical 问题或达到最大轮次
     """
     from app.agents.workflow import build_review_only_graph, build_fix_only_graph
     from app.core.diff_analyzer import DiffAnalyzer
     from app.schemas.state import ReviewState
 
-    # ── 准备阶段 ──
     analyzer = DiffAnalyzer()
-    detected = analyzer.detect_languages(diff_text)
-    chunk_list = analyzer.chunk_diff(diff_text)
-
-    if not detected:
-        console.print("[yellow]⚠️  无法识别编程语言，使用默认审查[/yellow]")
-        detected = ["unknown"]
-
-    console.print(f"[cyan]🔍 检测到语言: {', '.join(detected)}[/cyan]")
-    console.print(f"[cyan]📦 切分为 {len(chunk_list)} 个 Chunk (防上下文爆炸)[/cyan]")
-
-    diff_chunks = {c.chunk_id: c.content for c in chunk_list}
-
-    from app.core.repo_mapper import generate_repo_map
-    repo_context = generate_repo_map(repo_root)
-    console.print(f"[cyan]🗺️  Repo-Map 已生成 ({len(repo_context)} chars)[/cyan]")
-
-    initial_state: ReviewState = {
-        "vcs_provider": "cli",
-        "pr_id": f"local-{branch}",
-        "trigger_type": "cli",
-        "repo_id": repo_root,
-        "repo_context": repo_context,
-        "diff_chunks": diff_chunks,
-        "detected_languages": detected,
-        "review_issues": [],
-        "search_replace_blocks": [],
-        "test_logs": "",
-        "is_test_passed": False,
-        "retry_count": 0,
-        "error_count": 0,
-        "error_type": "",
-        "last_node": "",
-    }
-
-    # ── 阶段 1: 审查 ──
     review_graph = build_review_only_graph().compile()
+    fix_graph = build_fix_only_graph().compile()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("🤖 Agent 审查中...", total=None)
+    current_round = 0
+    all_round_issues = []
+    total_fixes_applied = 0
+    current_diff = diff_text
 
-        try:
-            review_state = await review_graph.ainvoke(initial_state)
-        except Exception as e:
-            progress.update(task, description=f"[red]❌ 审查失败: {e}[/red]")
-            console.print_exception()
-            raise typer.Exit(1)
+    while current_round < max_rounds:
+        current_round += 1
+        console.print(f"\n[bold cyan]═══ 第 {current_round}/{max_rounds} 轮审查 ═══[/bold cyan]")
 
-        progress.update(task, description="[green]✅ 审查完成[/green]")
+        # ── 准备阶段 ──
+        detected = analyzer.detect_languages(current_diff)
+        chunk_list = analyzer.chunk_diff(current_diff)
 
-    issues = review_state.get("review_issues", [])
+        if not detected:
+            console.print("[yellow]⚠️  无法识别编程语言，使用默认审查[/yellow]")
+            detected = ["unknown"]
 
-    # ── 用户交互：选择修复项 ──
-    if not issues:
+        if current_round == 1:
+            console.print(f"[cyan]🔍 检测到语言: {', '.join(detected)}[/cyan]")
+            console.print(f"[cyan]📦 切分为 {len(chunk_list)} 个 Chunk (防上下文爆炸)[/cyan]")
+
+        diff_chunks = {c.chunk_id: c.content for c in chunk_list}
+
+        from app.core.repo_mapper import generate_repo_map
+        repo_context = generate_repo_map(repo_root)
+        if current_round == 1:
+            console.print(f"[cyan]🗺️  Repo-Map 已生成 ({len(repo_context)} chars)[/cyan]")
+
+        initial_state: ReviewState = {
+            "vcs_provider": "cli",
+            "pr_id": f"local-{branch}",
+            "trigger_type": "cli",
+            "repo_id": repo_root,
+            "repo_context": repo_context,
+            "diff_chunks": diff_chunks,
+            "detected_languages": detected,
+            "review_issues": [],
+            "search_replace_blocks": [],
+            "test_logs": "",
+            "is_test_passed": False,
+            "retry_count": 0,
+            "error_count": 0,
+            "error_type": "",
+            "last_node": "",
+        }
+
+        # ── 审查 ──
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task(f"🤖 第 {current_round} 轮审查中...", total=None)
+
+            try:
+                review_state = await review_graph.ainvoke(initial_state)
+            except Exception as e:
+                progress.update(task, description=f"[red]❌ 审查失败: {e}[/red]")
+                console.print_exception()
+                raise typer.Exit(1)
+
+            progress.update(task, description="[green]✅ 审查完成[/green]")
+
+        issues = review_state.get("review_issues", [])
+
+        # ── 无问题 ──
+        if not issues:
+            console.print(Panel(
+                "[bold green]✅ 未发现问题 — 代码审查通过[/bold green]",
+                border_style="green",
+                padding=(0, 2),
+            ))
+            break
+
+        all_round_issues.extend(issues)
+
+        # ── 逐条展示问题 ──
+        severity_counts = {"critical": 0, "warning": 0, "info": 0}
+        for issue in issues:
+            sev = issue.get("severity", "info")
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+        badges = []
+        if severity_counts["critical"]:
+            badges.append(f"[bold red]🔴 Critical: {severity_counts['critical']}[/bold red]")
+        if severity_counts["warning"]:
+            badges.append(f"[yellow]🟡 Warning: {severity_counts['warning']}[/yellow]")
+        if severity_counts["info"]:
+            badges.append(f"[blue]🔵 Info: {severity_counts['info']}[/blue]")
+
+        console.print()
+        console.print(Panel(
+            f"[bold]🔍 发现 {len(issues)} 个问题 — {' | '.join(badges)}[/bold]",
+            border_style="blue",
+        ))
+        console.print()
+
+        sev_style = {"critical": "bold red", "warning": "yellow", "info": "cyan"}
+        sev_icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
+
+        for i, issue in enumerate(issues, 1):
+            sev = issue.get("severity", "info")
+            fp = issue.get("file_path", "")
+            ln = issue.get("line_number", "")
+            desc = issue.get("description", "")
+            sug = issue.get("suggestion", "")
+            loc = f"{fp}:{ln}" if ln else fp
+            content = f"[{sev_style.get(sev, 'white')}]{sev_icon.get(sev, '•')} [{sev.upper()}][/] [cyan]{loc}[/cyan]\n\n{desc}"
+            if sug:
+                content += f"\n[green]💡 建议:[/green] {sug}"
+            console.print(Panel(content, title=f"[dim]#{i}[/dim]", border_style=sev_style.get(sev, "white"), padding=(0, 1)))
+
+        # ── 用户决策：是否修复 ──
+        has_fixable = severity_counts["critical"] > 0 or severity_counts["warning"] > 0
+
+        if not has_fixable:
+            console.print("[green]✅ 仅有 info 级别提示，无需修复[/green]")
+            break
+
+        if current_round == 1:
+            fix_target = "critical + warning" if severity_counts["critical"] == 0 else "critical"
+            console.print(f"[bold]选择操作（目标: {fix_target} 问题）:[/bold]")
+            console.print("  [cyan]y[/cyan] — 自动修复")
+            console.print("  [cyan]n[/cyan] — 跳过，不修复")
+            console.print()
+
+            choice = console.input("[bold green]是否修复？(y/N) > [/bold green]").strip().lower()
+            if choice != "y":
+                console.print("[yellow]⏭️  已跳过修复，审查结束[/yellow]")
+                break
+        else:
+            console.print(f"[yellow]🔄 继续自动修复剩余问题...[/yellow]")
+
+        # ── 修复 ──
+        fix_state = dict(review_state)
+        fix_state["search_replace_blocks"] = []
+        fix_state["test_logs"] = ""
+        fix_state["is_test_passed"] = False
+        fix_state["retry_count"] = 0
+        fix_state["error_count"] = 0
+        fix_state["error_type"] = ""
+        fix_state["last_node"] = ""
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task(f"🔧 第 {current_round} 轮修复中...", total=None)
+
+            try:
+                final_state = await fix_graph.ainvoke(fix_state)
+            except Exception as e:
+                progress.update(task, description=f"[red]❌ 修复失败: {e}[/red]")
+                console.print_exception()
+                raise typer.Exit(1)
+
+            progress.update(task, description="[green]✅ 修复完成[/green]")
+
+        # ── 将修复写入磁盘（自动模式，跳过确认） ──
+        blocks = final_state.get("search_replace_blocks", [])
+        if blocks:
+            written = _apply_blocks_to_files(blocks, repo_root, auto_write=True)
+            total_fixes_applied += written or 0
+            if written:
+                # 重新获取最新 diff
+                new_diff = _get_git_diff("working")
+                if new_diff.strip():
+                    current_diff = new_diff
+                    console.print(f"[cyan]🔄 已重新获取最新 diff，准备下一轮审查[/cyan]")
+                else:
+                    console.print("[green]✅ 所有变更已提交，没有新的 diff[/green]")
+                    break
+            else:
+                console.print("[yellow]⚠️  没有文件被修改，停止循环[/yellow]")
+                break
+        else:
+            console.print("[yellow]⚠️  没有生成修复块，停止循环[/yellow]")
+            break
+
+    # ── 最终报告 ──
+    console.print(f"\n[bold cyan]═══ 审查完成（共 {current_round} 轮）═══[/bold cyan]")
+    if total_fixes_applied:
+        console.print(f"[green]📝 共写入 {total_fixes_applied} 个文件的修改[/green]")
+
+    if all_round_issues:
+        severity_counts = {"critical": 0, "warning": 0, "info": 0}
+        for issue in all_round_issues:
+            sev = issue.get("severity", "info")
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+        badges = []
+        if severity_counts["critical"]:
+            badges.append(f"[bold red]🔴 Critical: {severity_counts['critical']}[/bold red]")
+        if severity_counts["warning"]:
+            badges.append(f"[yellow]🟡 Warning: {severity_counts['warning']}[/yellow]")
+        if severity_counts["info"]:
+            badges.append(f"[blue]🔵 Info: {severity_counts['info']}[/blue]")
+
+        console.print(f"[bold]📊 累计发现 {len(all_round_issues)} 个问题 — {' | '.join(badges)}[/bold]")
+
+        if severity_counts["critical"] == 0 and severity_counts["warning"] == 0:
+            if current_round > 1:
+                console.print(Panel(
+                    "[bold green]🎉 所有问题已修复[/bold green]",
+                    border_style="green",
+                    padding=(0, 2),
+                ))
+            else:
+                console.print(Panel(
+                    "[bold green]✅ 仅有 info 提示，无需修复[/bold green]",
+                    border_style="green",
+                    padding=(0, 2),
+                ))
+        elif severity_counts["critical"] == 0:
+            console.print(Panel(
+                f"[bold yellow]📋 仍有 {severity_counts['warning']} 个 warning 问题（无 critical）[/bold yellow]",
+                border_style="yellow",
+                padding=(0, 2),
+            ))
+        else:
+            console.print(Panel(
+                f"[bold red]⚠️  还有 {severity_counts['critical']} 个 critical 问题未修复（已达最大轮次）[/bold red]",
+                border_style="red",
+                padding=(0, 2),
+            ))
+    else:
         console.print(Panel(
             "[bold green]✅ 未发现问题 — 代码审查通过[/bold green]",
             border_style="green",
             padding=(0, 2),
         ))
-        return
-
-    selected_issues = _prompt_issue_selection(issues)
-
-    if not selected_issues:
-        console.print("[yellow]⏭️  已跳过所有修复，审查结束[/yellow]")
-        return
-
-    # ── 阶段 2: 修复（仅处理用户选中的问题）──
-    fix_state = dict(review_state)
-    fix_state["review_issues"] = selected_issues
-    fix_state["search_replace_blocks"] = []
-    fix_state["test_logs"] = ""
-    fix_state["is_test_passed"] = False
-    fix_state["retry_count"] = 0
-    fix_state["error_count"] = 0
-    fix_state["error_type"] = ""
-    fix_state["last_node"] = ""
-
-    fix_graph = build_fix_only_graph().compile()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("🔧 Agent 修复中...", total=None)
-
-        try:
-            final_state = await fix_graph.ainvoke(fix_state)
-        except Exception as e:
-            progress.update(task, description=f"[red]❌ 修复失败: {e}[/red]")
-            console.print_exception()
-            raise typer.Exit(1)
-
-        progress.update(task, description="[green]✅ 修复完成[/green]")
-
-    # 显示最终结果（合并审查问题和修复结果）
-    final_state["review_issues"] = issues  # 显示全部原始问题
-    _display_results(final_state)
-
-    # ── 将修复写入磁盘 ──
-    blocks = final_state.get("search_replace_blocks", [])
-    if blocks:
-        _apply_blocks_to_files(blocks, repo_root)
 
 
 def _prompt_issue_selection(issues: list) -> list:
@@ -461,16 +597,24 @@ def _prompt_issue_selection(issues: list) -> list:
             return []
 
 
-def _apply_blocks_to_files(blocks: list, repo_root: str) -> None:
+def _apply_blocks_to_files(blocks: list, repo_root: str, auto_write: bool = False) -> int:
     """将 Search/Replace Blocks 应用到磁盘上的源文件。
 
     流程：读取源文件 → 展示变更预览 → 用户确认 → PatchApplier 写入
+
+    Args:
+        blocks: Search/Replace 块列表
+        repo_root: 仓库根目录
+        auto_write: 是否自动写入（跳过用户确认，用于多轮修复的后续轮次）
+
+    Returns:
+        写入的文件数量
     """
     from pathlib import Path
     from app.utils.patch_applier import PatchApplier
 
     if not blocks:
-        return
+        return 0
 
     # 收集需要读取的文件
     files_to_read: set[str] = set()
@@ -480,7 +624,7 @@ def _apply_blocks_to_files(blocks: list, repo_root: str) -> None:
             files_to_read.add(fp)
 
     if not files_to_read:
-        return
+        return 0
 
     # 读取源文件
     source_files: dict[str, str] = {}
@@ -496,7 +640,7 @@ def _apply_blocks_to_files(blocks: list, repo_root: str) -> None:
 
     if not source_files:
         console.print("[yellow]⚠️  无法读取任何源文件，跳过写入[/yellow]")
-        return
+        return 0
 
     # 展示变更预览
     console.print()
@@ -524,12 +668,13 @@ def _apply_blocks_to_files(blocks: list, repo_root: str) -> None:
             padding=(0, 1),
         ))
 
-    # 用户确认
-    console.print()
-    confirm = console.input("[bold green]确认写入以上修改？(y/N) > [/bold green]").strip().lower()
-    if confirm != "y":
-        console.print("[yellow]⏭️  已跳过文件写入[/yellow]")
-        return
+    # 用户确认（auto_write 模式下跳过确认）
+    if not auto_write:
+        console.print()
+        confirm = console.input("[bold green]确认写入以上修改？(y/N) > [/bold green]").strip().lower()
+        if confirm != "y":
+            console.print("[yellow]⏭️  已跳过文件写入[/yellow]")
+            return 0
 
     # 应用 patches
     applier = PatchApplier()
@@ -557,6 +702,8 @@ def _apply_blocks_to_files(blocks: list, repo_root: str) -> None:
         border_style="green",
         padding=(0, 2),
     ))
+    
+    return written
 
 
 def _display_results(state: dict) -> None:
@@ -802,7 +949,6 @@ async def _run_multiround_review(
     await session.start()
 
     # ── 构建初始状态 ──
-    import asyncio as aio
 
     initial_state: ReviewState = {
         "vcs_provider": "cli",
