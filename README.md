@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>🤖 Multi-Agent System for Automated Code Review</strong><br>
-  <em>LangGraph Orchestration · 9-Language Sandbox · GitLab & GitHub</em>
+  <em>LangGraph Orchestration · 9-Language Sandbox · GitLab & GitHub · Multi-Round Interactive Review</em>
 </p>
 
 <p align="center">
@@ -24,6 +24,7 @@ AutoReviewer-MAS is an automated code review system powered by a Multi-Agent arc
 - 🔧 **Auto-Fix**: Generates precise Search/Replace blocks (not fragile unified diffs)
 - 🧪 **Sandboxed Testing**: Isolated Docker containers with 9-language support
 - 🔄 **Iterative Improvement**: Review → Fix → Test → Retry loop (max 3 iterations)
+- 🗣️ **Multi-Round Interactive Review**: Real-time user intervention with natural language instructions
 - 🛡️ **HITL Approval**: High-risk operations require human approval via Feishu/DingTalk
 - 📊 **Observability**: Optional Langfuse integration for token cost tracking
 
@@ -55,13 +56,25 @@ Webhook → Redis Stream → Worker → LangGraph StateGraph → VCS Comment
                                 → critic → tester
 ```
 
-**Graph Topology (Send API dynamic fan-out):**
+**Graph Topology (V4.0 Multi-round - Interactive mode):**
 ```
-__start__ → router_node → Send(reviewer_node) → fixer_node → critic_node → tester_node → submit_node → END
-                              ↑                        ↓              │
-                              └── (retry < 3) ─────────┘              │
-                              ↑                                       │
-                              └── error_recovery_node ←───────────────┘
+__start__ → router_node → Send(reviewer_node) × N
+                                  ↓
+                         reduce_reviewer_node (merge results)
+                                  ↓
+                    ┌─ error_recovery_node (error recovery)
+                    ├─ fixer_node (has critical issues)
+                    └─ user_checkpoint_node (no critical issues)
+                                  ↓ (interrupt pause)
+                         fixer_node → critic_node
+                                  ↓
+                    ┌─ fixer_node (critic rejects)
+                    └─ decision_node (critic passes)
+                                  ↓
+                    ┌─ reviewer_node (next round)
+                    └─ submit_node (termination)
+                                  ↓
+                               END
 ```
 
 ## Quick Start
@@ -86,24 +99,6 @@ cp config/settings.yaml.example config/settings.yaml
 
 ### Environment Variables
 
-Set environment variables **in the project root directory** before running. You can use a `.env` file or export directly:
-
-```bash
-# Option 1: Export in shell (persists for current session)
-export MIMO_API_KEY=your-api-key-here
-export GITHUB_TOKEN=your-github-token
-
-# Option 2: Create .env file in AutoReviewer-MAS project root
-# (only works when running from AutoReviewer-MAS directory)
-cat > /path/to/AutoReviewer-MAS/.env << 'EOF'
-MIMO_API_KEY=your-api-key-here
-GITHUB_TOKEN=your-github-token
-EOF
-```
-
-> 💡 **Tip**: When reviewing other projects, export env vars in your shell profile
-> (`~/.bashrc`, `~/.zshrc`, or PowerShell `$PROFILE`) so they are always available.
-
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MIMO_API_KEY` | Yes | LLM gateway API key |
@@ -111,30 +106,16 @@ EOF
 | `GITHUB_TOKEN` | For GitHub | GitHub API token |
 | `GITHUB_WEBHOOK_SECRET` | Recommended | GitHub webhook HMAC secret |
 | `GITLAB_WEBHOOK_SECRET` | Recommended | GitLab webhook token |
-| `APPROVAL_WEBHOOK_URL` | Optional | Feishu/DingTalk approval webhook (auto-detects channel) |
-| `WECOM_WEBHOOK_URL` | Optional | WeCom (企业微信) approval webhook |
+| `APPROVAL_WEBHOOK_URL` | Optional | Feishu/DingTalk approval webhook |
+| `WECOM_WEBHOOK_URL` | Optional | WeCom approval webhook |
 | `LANGFUSE_SECRET_KEY` | Optional | Langfuse monitoring |
-
-> 💡 `APPROVAL_WEBHOOK_URL` and `WECOM_WEBHOOK_URL` can be set simultaneously —
-> notifications will be sent to all configured channels.
 
 ### Usage
 
-**CLI Local Review (review code in any project):**
+**CLI Local Review (single-round):**
 
-> ⚠️ **Important**: The CLI must be able to import the `app` module from AutoReviewer-MAS.
-> You have two options:
-
-**Option A — Install as editable package (recommended):**
 ```bash
-# In AutoReviewer-MAS directory, install once:
-cd /path/to/AutoReviewer-MAS
-pip install -e .
-
-# Then in ANY project directory:
-cd /path/to/your-project
-
-# Review all working tree changes (staged + unstaged, default)
+# Review all working tree changes
 python -m app.cli.main local
 
 # Review only staged changes
@@ -143,28 +124,38 @@ python -m app.cli.main local --staged
 # Review diff against another branch
 python -m app.cli.main local --branch feature/auth
 
-# Review a specific commit
-python -m app.cli.main local --commit abc1234
-
-# Review a range of commits
-python -m app.cli.main local --range abc1234..def5678
-
-# Full codebase scan (all source files)
+# Full codebase scan
 python -m app.cli.main local --full
 ```
 
-**Option B — Set PYTHONPATH:**
-```bash
-# Set PYTHONPATH to AutoReviewer-MAS directory before running:
-export PYTHONPATH=/path/to/AutoReviewer-MAS
+**CLI Multi-Round Interactive Review (V4.0):**
 
-# Then in any project directory:
-cd /path/to/your-project
-python -m app.cli.main local
+```bash
+# Multi-round review with interactive user input
+python -m app.cli.main multiround
+
+# Set maximum review rounds
+python -m app.cli.main multiround --max-rounds 5
+
+# Auto-approve mode (no user confirmation needed)
+python -m app.cli.main multiround --auto-approve
+
+# Multi-round review against a branch
+python -m app.cli.main multiround --branch feature/auth
 ```
 
-> 💡 Environment variables (`MIMO_API_KEY`, etc.) must be set in the shell
-> where you run the command, not necessarily in the project directory.
+During multi-round review, you can interact with the system in real-time:
+
+| Command | Action |
+|---------|--------|
+| `y` / `yes` / `是` | Approve and apply fixes |
+| `n` / `no` / `否` | Reject fixes |
+| `stop` / `停止` | Stop execution |
+| `skip` / `跳过` | Skip current round |
+| `忽略性能问题` | Ignore issues in specific category |
+| `只关注安全问题` | Focus on specific category only |
+| `检查 auth.py` | Focus on specific file |
+| `最多修2次` | Set max review rounds |
 
 **API Server (webhook mode):**
 ```bash
@@ -174,45 +165,57 @@ python main.py
 #   POST /api/v1/webhook/github
 ```
 
-**Worker Process:**
-```bash
-python -m app.infra.worker
-```
-
 ### Testing
 
 ```bash
-pip install pytest pytest-asyncio pytest-cov
 pytest
 pytest --cov=app --cov-report=term-missing
 ```
 
 ## Features
 
-### V3.0 (Current)
+### V4.0 (Current)
 
-- **Zero-Dependency Mode**: Run locally without Redis/Postgres/Docker using `local_mode` config
-- **RAG Context Retrieval**: LanceDB-based semantic code search for better context recall
-- **Error Recovery Node**: Automatic retry with exponential backoff for 429/network errors
-- **Adaptive Sandbox**: Auto-degrades Docker → Shell → Null when engines are unavailable
-- **SQLite Checkpointer**: Zero-dependency state persistence alternative to Postgres
-- **Health/Readiness Probes**: `/health` and `/ready` endpoints for deployment monitoring
-- **Auto-Fix Write-Back**: Fixer patches are applied to source files on disk (with user confirmation)
-- **Test Suite**: Comprehensive unit and integration tests with pytest
+- **Multi-Round Interactive Review**: Real-time user intervention via LangGraph `interrupt()` mechanism
+- **Intelligent Instruction Parser**: Natural language command parsing
+- **Map-Reduce Aggregation**: `reduce_reviewer_node` deduplicates concurrent reviewer results
+- **Convergence Detection**: Auto-stops after consecutive zero-issue rounds
+- **User Checkpoint Node**: Issue summaries and user approval/rejection
+- **Prefix Caching**: System prompts with `cache_control` for supported LLM providers
+
+### V3.0
+
+- **Zero-Dependency Mode**: Run locally without Redis/Postgres/Docker
+- **RAG Context Retrieval**: LanceDB-based semantic code search
+- **Error Recovery Node**: Automatic retry with exponential backoff
+- **Adaptive Sandbox**: Auto-degrades Docker → Shell → Null
+- **Health/Readiness Probes**: `/health` and `/ready` endpoints
+- **Auto-Fix Write-Back**: Fixer patches applied to source files
 
 ### V2.0
 
-- **Multi-VCS Support**: GitLab and GitHub with unified VCS abstraction layer
-- **Search/Replace Block**: Precise code modifications replacing fragile unified diffs
-- **Rule-Based Critic**: Zero-LLM-cost quality checks (bracket matching, empty content)
-- **9-Language Sandbox**: Language-specific Docker images with command whitelisting
-- **Circuit Breaker**: pybreaker integration for LLM and VCS API resilience
-- **Redis Streams**: Decoupled webhook ingestion with consumer group load balancing
-- **HITL Approval**: High-risk operation detection with Feishu/DingTalk notifications
+- **Multi-VCS Support**: GitLab and GitHub with unified abstraction
+- **Search/Replace Block**: Precise code modifications
+- **Rule-Based Critic**: Zero-LLM-cost quality checks
+- **9-Language Sandbox**: Language-specific Docker images
+- **Circuit Breaker**: pybreaker integration for API resilience
+- **Redis Streams**: Decoupled webhook ingestion
+- **HITL Approval**: High-risk operation detection
 
 ## Configuration
 
 See [config/settings.yaml.example](config/settings.yaml.example) for the full configuration reference.
+
+### Multi-Round Review (V4.0)
+
+```yaml
+multiround:
+  enabled: true
+  max_rounds: 3
+  auto_approve: false
+  convergence_threshold: 2
+  user_input_timeout: 30
+```
 
 ### Local Mode (Zero Dependencies)
 
@@ -224,20 +227,15 @@ local_mode:
   sandbox: "auto"
 ```
 
-When `local_mode.enabled = true`:
-- Queue uses `asyncio.Queue` instead of Redis Streams
-- Checkpointer uses SQLite/MemorySaver instead of Postgres
-- Sandbox auto-degrades from Docker → Shell → Null
-
-### RAG Configuration
+### Prefix Caching
 
 ```yaml
-rag:
-  enabled: true
-  embedding_model: "text-embedding-3-small"
-  embedding_api_base: "https://your-llm-gateway.com/v1"
-  db_path: ".lancedb"
-  top_k: 10
+llm:
+  roles:
+    reviewer:
+      prefix_caching: true
+    fixer:
+      prefix_caching: true
 ```
 
 ## Development
@@ -245,16 +243,58 @@ rag:
 ```bash
 # Install dev dependencies
 pip install -r requirements.txt
-pip install pytest pytest-asyncio pytest-cov
 
-# Run tests
+# Run all tests
 pytest
 
-# Run with coverage
-pytest --cov=app --cov-report=term-missing
+# Run multi-round review tests
+pytest tests/unit/test_multiround.py -v
 
-# Run specific test module
-pytest tests/unit/test_critic.py -v
+# Run prefix caching tests
+pytest tests/unit/test_prefix_caching.py -v
+```
+
+### Project Structure
+
+```
+AutoReviewer-MAS/
+├── app/
+│   ├── agents/
+│   │   ├── nodes/
+│   │   │   ├── reviewer.py          # Reviewer agent
+│   │   │   ├── fixer.py             # Fixer agent
+│   │   │   ├── critic.py            # Rule-based critic
+│   │   │   ├── reduce_reviewer.py   # Map-Reduce aggregation
+│   │   │   ├── decision.py          # Multi-round decision logic
+│   │   │   ├── user_checkpoint.py   # User interaction checkpoint
+│   │   │   └── error_recovery.py    # Error recovery with backoff
+│   │   ├── prompts/                 # LLM system prompts
+│   │   ├── workflow.py              # Single-round graph
+│   │   └── workflow_multiround.py   # Multi-round interactive graph
+│   ├── cli/
+│   │   ├── main.py                  # CLI entry point
+│   │   └── interactive.py           # Interactive session manager
+│   ├── core/
+│   │   ├── config.py                # Settings loader
+│   │   ├── diff_analyzer.py         # Diff chunking
+│   │   ├── llm_factory.py           # LLM factory with retry
+│   │   ├── cache_utils.py           # Prefix caching
+│   │   └── language_matrix.py       # 9-language matrix
+│   ├── schemas/
+│   │   ├── state.py                 # ReviewState TypedDict
+│   │   ├── llm_out.py               # LLM output models
+│   │   └── user_input.py            # User input models
+│   └── utils/
+│       ├── instruction_parser.py    # NL instruction parser
+│       └── patch_applier.py         # Search/Replace applier
+├── config/
+│   └── settings.yaml.example
+├── tests/
+│   └── unit/
+│       ├── test_multiround.py       # Multi-round tests (38 cases)
+│       └── test_prefix_caching.py   # Prefix caching tests (10 cases)
+├── CLAUDE.md
+└── README.md
 ```
 
 ## License

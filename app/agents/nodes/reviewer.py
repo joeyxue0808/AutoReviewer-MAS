@@ -92,10 +92,10 @@ async def reviewer_node(state: ReviewState) -> Dict[str, Any]:
         elif "connection" in error_str.lower():
             error_type = "connection"
         logger.error("Reviewer LLM 调用失败: %s (type=%s)", e, error_type)
+        # 不写入 error_type/last_node（并发 reviewer 会冲突）
+        # review-only graph 中无 error_recovery 节点，错误仅记录日志
         return {
             "review_issues": [],
-            "error_type": error_type,
-            "last_node": "reviewer_node",
             "error_count": state.get("error_count", 0) + 1,
         }
 

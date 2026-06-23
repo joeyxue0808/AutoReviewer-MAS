@@ -26,6 +26,7 @@ _PRE_CHUNKED_RE = re.compile(r"^[a-z]+_\d+$")
 from app.agents.nodes.critic import critic_node
 from app.agents.nodes.error_recovery import error_recovery_node
 from app.agents.nodes.fixer import fixer_node
+from app.agents.nodes.reduce_reviewer import reduce_reviewer_node
 from app.agents.nodes.reviewer import reviewer_node
 from app.agents.nodes.tester import tester_node
 from app.core.config import settings
@@ -326,14 +327,15 @@ def build_graph() -> StateGraph:
     """构建 LangGraph StateGraph。
 
     拓扑：
-        router → Send(reviewer) → fixer → critic → tester → submit → END
-                  ↑                        ↓
-                  └── (retry < 3) ─────────┘
+        router → Send(reviewer) × N → reduce_reviewer → fixer → critic → tester → submit → END
+                  ↑                                          ↑         ↓
+                  └──────────────────────────────────────────┘         └── (retry < 3) ──┘
     """
     graph = StateGraph(ReviewState)
 
     # 添加节点
     graph.add_node("reviewer_node", reviewer_node)
+    graph.add_node("reduce_reviewer_node", reduce_reviewer_node)
     graph.add_node("fixer_node", fixer_node)
     graph.add_node("critic_node", critic_node)
     graph.add_node("tester_node", tester_node)
@@ -343,9 +345,12 @@ def build_graph() -> StateGraph:
     # router 使用 Send API 动态分发
     graph.add_conditional_edges("__start__", router_node)
 
-    # reviewer → (fixer | error_recovery | END)
+    # reviewer → reduce_reviewer（合并多个 reviewer 结果）
+    graph.add_edge("reviewer_node", "reduce_reviewer_node")
+
+    # reduce_reviewer → (fixer | error_recovery | END)
     graph.add_conditional_edges(
-        "reviewer_node",
+        "reduce_reviewer_node",
         _after_reviewer,
         {"fixer_node": "fixer_node", "error_recovery_node": "error_recovery_node", "__end__": END},
     )

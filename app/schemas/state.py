@@ -12,7 +12,7 @@ V3.0 变更点：
 """
 
 import operator
-from typing import Annotated, Any, Dict, List, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -70,7 +70,7 @@ class SearchReplaceBlock(BaseModel):
 
 
 class ReviewState(TypedDict):
-    """LangGraph 全局状态定义 - V3.0 增强版。
+    """LangGraph 全局状态定义 - V3.0 增强版（支持多轮审查）。
 
     所有节点通过读写此 TypedDict 进行数据流转。
     """
@@ -105,3 +105,20 @@ class ReviewState(TypedDict):
     # ── 错误恢复 (V3.0) ──
     error_type: str  # 错误类型: "429" / "timeout" / "connection" / ""
     last_node: str  # 出错的节点名（用于 error_recovery 路由回原节点）
+
+    # ── 多轮审查控制 (V4.0) ──
+    current_round: int  # 当前轮次（从 0 开始）
+    max_rounds: int  # 最大轮次限制（默认 3）
+    round_issues: Annotated[List[Dict[str, Any]], operator.add]  # 每轮发现的问题
+
+    # ── 用户干预相关 ──
+    user_input_queue: Any  # 异步队列，用于接收用户输入
+    user_instructions: str  # 当前有效的用户指令
+    user_decisions: Dict[str, bool]  # 用户对问题的决策
+    pending_user_approval: bool  # 是否在等待用户批准
+    user_approval_result: Optional[bool]  # 用户批准结果
+
+    # ── 多轮结果追踪 ──
+    fixed_issues: Annotated[List[Dict[str, Any]], operator.add]  # 已修复的问题
+    remaining_issues: List[Dict[str, Any]]  # 剩余问题
+    round_reports: List[Dict[str, Any]]  # 每轮的报告

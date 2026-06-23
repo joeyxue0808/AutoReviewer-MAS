@@ -36,6 +36,7 @@ class LLMRoleConfig(BaseModel):
     api_key_env: str = "OPENAI_API_KEY"
     temperature: float = 0.3
     max_tokens: int = 4096
+    prefix_caching: bool = False  # 启用前缀缓存（需 LLM Provider 支持）
 
     @property
     def api_key(self) -> str:

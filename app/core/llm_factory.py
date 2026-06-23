@@ -25,6 +25,7 @@ from tenacity import (
 # 并发信号量：限制同时进行的 LLM 请求数，防止触发网关限流
 _LLM_SEMAPHORE = asyncio.Semaphore(8)
 
+from app.core.cache_utils import apply_prefix_cache_to_messages
 from app.core.config import settings
 from app.infra.circuit_breaker import llm_breaker
 
@@ -107,10 +108,13 @@ class RetryableChatModel(BaseChatModel):
     _inner: ChatOpenAI
     _retry_decorator: Any
 
-    def __init__(self, inner: ChatOpenAI, **kwargs: Any):
+    _prefix_caching_enabled: bool
+
+    def __init__(self, inner: ChatOpenAI, prefix_caching: bool = False, **kwargs: Any):
         retry_config = settings.llm.retry
         super().__init__(**kwargs)
         object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_prefix_caching_enabled", prefix_caching)
         object.__setattr__(
             self,
             "_retry_decorator",
@@ -191,8 +195,13 @@ class RetryableChatModel(BaseChatModel):
         @self._retry_decorator
         async def _inner_agenerate() -> Any:
             async with _LLM_SEMAPHORE:
+                # 应用前缀缓存标记（如果启用）
+                processed_messages = apply_prefix_cache_to_messages(
+                    messages,
+                    enabled=self._prefix_caching_enabled,
+                )
                 return await self._inner._agenerate(
-                    messages, stop=stop, run_manager=run_manager, **kwargs
+                    processed_messages, stop=stop, run_manager=run_manager, **kwargs
                 )
 
         return await _inner_agenerate()
@@ -279,15 +288,19 @@ def get_llm(role: str, trace_id: Optional[str] = None) -> RetryableChatModel:
         callbacks=callbacks if callbacks else None,
     )
 
+    # 获取前缀缓存配置（默认关闭）
+    prefix_caching_enabled = getattr(role_config, 'prefix_caching', False)
+
     logger.info(
-        "已创建 LLM 实例: role=%s, model=%s, temp=%.1f, top_p=%.1f",
+        "已创建 LLM 实例: role=%s, model=%s, temp=%.1f, top_p=%.1f, prefix_caching=%s",
         role,
         role_config.model,
         role_params.get("temperature", role_config.temperature),
         role_params.get("top_p", 1.0),
+        prefix_caching_enabled,
     )
 
     # 包装带重试机制的模型并缓存
-    instance = RetryableChatModel(inner=chat_model)
+    instance = RetryableChatModel(inner=chat_model, prefix_caching=prefix_caching_enabled)
     _LLM_CACHE[role] = instance
     return instance

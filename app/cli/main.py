@@ -690,9 +690,214 @@ def _display_results(state: dict) -> None:
 
 
 @app.command()
+def multiround(
+    staged: bool = typer.Option(False, "--staged/--all", help="仅审查暂存区 (--staged) 或全部变更 (--all，默认)"),
+    branch: str = typer.Option(None, "--branch", "-b", help="与指定分支对比差异"),
+    commit: str = typer.Option(None, "--commit", "-c", help="审查指定 commit 的变更 (SHA)"),
+    range: str = typer.Option(None, "--range", "-r", help="审查 commit 范围 (如 abc123..def456)"),
+    full: bool = typer.Option(False, "--full", "-f", help="全量扫描（审查整个代码库，非增量）"),
+    max_rounds: int = typer.Option(3, "--max-rounds", "-m", help="最大审查轮次"),
+    auto_approve: bool = typer.Option(False, "--auto-approve", "-a", help="自动批准修复（无需用户确认）"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
+):
+    """🔄 多轮交互式审查模式。
+
+    支持自动多轮 review → fix → critic 循环，用户可以实时输入指令干预。
+    \b
+    交互指令：
+      y/yes/是       批准修复
+      n/no/否        拒绝修复
+      stop/停止      停止执行
+      skip/跳过      跳过当前轮次
+      忽略xxx问题    忽略特定类别问题
+      只关注xxx问题  只处理特定类别问题
+    """
+    _setup_logging(verbose)
+
+    # 显示 Banner
+    console.print(Panel.fit(
+        "[bold cyan]🤖 AutoReviewer-MAS[/bold cyan]\n"
+        "[dim]多轮交互式审查模式[/dim]\n"
+        f"[dim]最大轮次: {max_rounds} | 自动批准: {'是' if auto_approve else '否'}[/dim]",
+        border_style="cyan",
+    ))
+
+    # 获取 Git 信息
+    repo_root = _get_repo_root()
+    current_branch = branch or _get_git_branch()
+
+    # 确定 diff 模式
+    if full:
+        diff_text = _get_full_scan_diff(repo_root)
+    elif commit:
+        diff_text = _get_git_diff(mode=f"commit:{commit}")
+        current_branch = f"commit-{commit[:8]}"
+    elif range:
+        diff_text = _get_git_diff(mode=f"range:{range}")
+        current_branch = f"range-{range[:16]}"
+    elif branch:
+        diff_text = _get_git_diff(mode=f"branch:{branch}")
+    elif staged:
+        diff_text = _get_git_diff(mode="staged")
+    else:
+        diff_text = _get_git_diff(mode="working")
+
+    if not diff_text.strip():
+        console.print("[yellow]⚠️  没有检测到代码变更[/yellow]")
+        raise typer.Exit(0)
+
+    # 显示变更概览
+    _display_diff_summary(diff_text)
+
+    # 执行多轮审查
+    console.print()
+    asyncio.run(_run_multiround_review(
+        diff_text=diff_text,
+        branch=current_branch,
+        repo_root=repo_root,
+        max_rounds=max_rounds,
+        auto_approve=auto_approve,
+    ))
+
+
+async def _run_multiround_review(
+    diff_text: str,
+    branch: str,
+    repo_root: str,
+    max_rounds: int = 3,
+    auto_approve: bool = False,
+) -> None:
+    """执行多轮交互式审查流水线。"""
+    from app.agents.workflow_multiround import build_multiround_graph
+    from app.core.diff_analyzer import DiffAnalyzer
+    from app.cli.interactive import InteractiveSession, RealTimeDisplay
+    from app.schemas.state import ReviewState
+
+    # ── 准备阶段 ──
+    analyzer = DiffAnalyzer()
+    detected = analyzer.detect_languages(diff_text)
+    chunk_list = analyzer.chunk_diff(diff_text)
+
+    if not detected:
+        console.print("[yellow]⚠️  无法识别编程语言，使用默认审查[/yellow]")
+        detected = ["unknown"]
+
+    console.print(f"[cyan]🔍 检测到语言: {', '.join(detected)}[/cyan]")
+    console.print(f"[cyan]📦 切分为 {len(chunk_list)} 个 Chunk[/cyan]")
+
+    diff_chunks = {c.chunk_id: c.content for c in chunk_list}
+
+    from app.core.repo_mapper import generate_repo_map
+    repo_context = generate_repo_map(repo_root)
+    console.print(f"[cyan]🗺️  Repo-Map 已生成 ({len(repo_context)} chars)[/cyan]")
+
+    # ── 启动交互式会话 ──
+    session = InteractiveSession(
+        auto_approve=auto_approve,
+        input_timeout=30,
+    )
+    display = RealTimeDisplay()
+    display.show_welcome()
+
+    await session.start()
+
+    # ── 构建初始状态 ──
+    import asyncio as aio
+
+    initial_state: ReviewState = {
+        "vcs_provider": "cli",
+        "pr_id": f"local-{branch}",
+        "trigger_type": "cli",
+        "repo_id": repo_root,
+        "repo_context": repo_context,
+        "diff_chunks": diff_chunks,
+        "detected_languages": detected,
+        "review_issues": [],
+        "search_replace_blocks": [],
+        "test_logs": "",
+        "is_test_passed": False,
+        "retry_count": 0,
+        "error_count": 0,
+        "error_type": "",
+        "last_node": "",
+        # 多轮审查字段
+        "current_round": 0,
+        "max_rounds": max_rounds,
+        "round_issues": [],
+        "user_input_queue": session.input_queue,
+        "user_instructions": "",
+        "user_decisions": {},
+        "pending_user_approval": False,
+        "user_approval_result": None,
+        "fixed_issues": [],
+        "remaining_issues": [],
+        "round_reports": [],
+    }
+
+    # ── 构建并执行 Graph ──
+    graph = build_multiround_graph()
+    compiled_graph = graph.compile()
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("🤖 多轮审查中...", total=None)
+
+            # 流式执行 Graph
+            async for event in compiled_graph.astream(initial_state, {"recursion_limit": 50}):
+                # 更新进度显示
+                for node_name, node_output in event.items():
+                    if node_name == "reviewer_node":
+                        progress.update(task, description="🔍 Reviewer 审查中...")
+                        issues = node_output.get("review_issues", [])
+                        if issues:
+                            display.show_issues_found(issues)
+                    elif node_name == "reduce_reviewer_node":
+                        progress.update(task, description="📊 合并审查结果...")
+                    elif node_name == "fixer_node":
+                        progress.update(task, description="🔧 Fixer 修复中...")
+                    elif node_name == "critic_node":
+                        progress.update(task, description="🔎 Critic 校验中...")
+                    elif node_name == "user_checkpoint_node":
+                        progress.update(task, description="👤 等待用户输入...")
+                        if node_output.get("pending_user_approval"):
+                            display.show_approval_prompt()
+                            # 等待用户输入
+                            user_text = await session.get_user_input(timeout=60)
+                            if user_text:
+                                display.show_user_input_received(user_text)
+                                await session.put_user_input(user_text)
+                    elif node_name == "decision_node":
+                        progress.update(task, description="🧠 决策中...")
+                    elif node_name == "submit_node":
+                        progress.update(task, description="[green]✅ 生成报告[/green]")
+                        # 显示最终报告
+                        report = node_output.get("review_report", "")
+                        stats = node_output.get("review_stats", {})
+                        display.show_final_report(report, stats)
+
+            progress.update(task, description="[green]✅ 多轮审查完成[/green]")
+
+    except Exception as e:
+        display.show_error(str(e))
+        console.print_exception()
+        raise typer.Exit(1)
+    finally:
+        await session.stop()
+
+    # ── 将修复写入磁盘 ──
+    # 注意：多轮模式下修复已在循环中逐步应用
+    # 这里可以输出统计信息
+    console.print("\n[dim]审查流程已完成[/dim]")
+
+
+@app.command()
 def version():
     """📌 显示版本信息。"""
-    console.print("AutoReviewer-MAS CLI v0.4.0")
+    console.print("AutoReviewer-MAS CLI v0.5.0")
 
 
 if __name__ == "__main__":

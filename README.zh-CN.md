@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>🤖 多智能体自动代码审查系统</strong><br>
-  <em>LangGraph 编排 · 9 语言沙盒 · GitLab & GitHub 双平台</em>
+  <em>LangGraph 编排 · 9 语言沙盒 · GitLab & GitHub · 多轮交互式审查</em>
 </p>
 
 <p align="center">
@@ -24,6 +24,7 @@ AutoReviewer-MAS 是一个基于多智能体架构的自动代码审查系统。
 - 🔧 **自动修复**：生成精确的 Search/Replace Block（替代脆弱的 unified diff）
 - 🧪 **沙盒测试**：Docker 隔离容器执行，支持 9 种语言的测试和 lint
 - 🔄 **迭代改进**：审查 → 修复 → 测试 → 重试循环（最多 3 轮）
+- 🗣️ **多轮交互式审查**：支持用户实时输入指令干预审查流程
 - 🛡️ **人工审批**：高风险操作通过飞书/钉钉通知 Tech Lead 审批
 - 📊 **可观测性**：可选 Langfuse 集成，追踪 token 消耗和 LLM 调用链
 
@@ -55,22 +56,37 @@ Webhook → Redis Stream → Worker → LangGraph StateGraph → VCS 评论
                                 → critic → tester
 ```
 
-**Graph 拓扑（Send API 动态扇出）：**
+**Graph 拓扑（V4.0 多轮交互模式）：**
 ```
-__start__ → router_node → Send(reviewer_node) → fixer_node → critic_node → tester_node → submit_node → END
-                              ↑                        ↓              │
-                              └── (retry < 3) ─────────┘              │
-                              ↑                                       │
-                              └── error_recovery_node ←───────────────┘
+__start__ → router_node → Send(reviewer_node) × N
+                                  ↓
+                         reduce_reviewer_node (合并结果)
+                                  ↓
+                    ┌─ error_recovery_node (错误恢复)
+                    ├─ fixer_node (有 critical 问题)
+                    └─ user_checkpoint_node (无 critical 问题)
+                                  ↓ (interrupt 暂停)
+                         fixer_node → critic_node
+                                  ↓
+                    ┌─ fixer_node (critic 拒绝)
+                    └─ decision_node (critic 通过)
+                                  ↓
+                    ┌─ reviewer_node (继续下一轮)
+                    └─ submit_node (终止条件)
+                                  ↓
+                               END
 ```
 
 **关键设计决策：**
-- **无向量数据库**：Agent 工具是纯 Python 函数（文件读取、正则符号搜索、os.walk），非 RAG 检索
 - **预加载优于 ReAct**：Reviewer/Fixer 预加载文件上下文到 prompt，单次 LLM 调用完成
 - **Search/Replace Block**：LLM 生成精确的搜索/替换对，比 diff 格式更可靠
 - **Critic 是规则引擎**：括号匹配、空内容、重复编辑 — 零 LLM 成本，即时执行
 - **CLI 跳过沙盒**：Docker 冷启动慢；CLI 模式自动跳过沙盒测试
 - **retry_count 由 workflow 层管理**：Critic/Fixer 不递增 retry_count
+- **多轮 interrupt 机制**：用户检查点使用 LangGraph `interrupt()` 暂停图执行，等待用户输入
+- **智能指令解析**：`instruction_parser.py` 解析自然语言指令（"忽略性能问题"、"只关注安全问题"）
+- **Map-Reduce 聚合**：`reduce_reviewer_node` 对并发 reviewer 结果去重、按严重级别排序
+- **前缀缓存**：System Prompt 标记 `cache_control`，为支持的 LLM 提供商节省 50% token 成本
 
 ## 快速开始
 
@@ -170,6 +186,39 @@ python -m app.cli.main local
 
 > 💡 Windows PowerShell 用户使用：`$env:PYTHONPATH = "D:\path\to\AutoReviewer-MAS"`
 
+**CLI 多轮交互式审查（V4.0 新功能）：**
+
+```bash
+# 多轮交互式审查，支持实时输入指令
+python -m app.cli.main multiround
+
+# 指定最大审查轮次
+python -m app.cli.main multiround --max-rounds 5
+
+# 自动批准模式（无需用户确认）
+python -m app.cli.main multiround --auto-approve
+
+# 与指定分支对比的多轮审查
+python -m app.cli.main multiround --branch feature/auth
+
+# 全量扫描的多轮审查
+python -m app.cli.main multiround --full
+```
+
+多轮审查过程中，支持以下实时交互指令：
+
+| 指令 | 动作 |
+|------|------|
+| `y` / `yes` / `是` | 批准并应用修复 |
+| `n` / `no` / `否` | 拒绝修复 |
+| `stop` / `停止` | 停止执行 |
+| `skip` / `跳过` | 跳过当前轮次 |
+| `忽略性能问题` | 忽略特定类别问题 |
+| `只关注安全问题` | 只关注特定类别问题 |
+| `检查 auth.py` | 针对特定文件 |
+| `最多修2次` | 设置最大审查轮次 |
+| `3次修复后停止` | 到达轮次后停止 |
+
 **API 服务（Webhook 模式）：**
 ```bash
 python main.py
@@ -193,7 +242,16 @@ pytest --cov=app --cov-report=term-missing
 
 ## 功能特性
 
-### V3.0 (当前版本)
+### V4.0（当前版本）
+
+- **多轮交互式审查**：基于 LangGraph `interrupt()` 机制的实时用户干预
+- **智能指令解析**：自然语言指令解析（"忽略性能问题"、"只关注安全问题"、"3次修复后停止"）
+- **Map-Reduce 聚合**：`reduce_reviewer_node` 对并发 reviewer 结果去重、按严重级别排序
+- **收敛检测**：连续无新问题的轮次自动停止
+- **用户检查点**：展示问题摘要，等待用户批准/拒绝
+- **前缀缓存**：System Prompt 标记 `cache_control`，支持 Claude 3.5/vLLM 等 Provider
+
+### V3.0
 
 - **零依赖模式**：通过 `local_mode` 配置，无需 Redis/Postgres/Docker 即可本地运行
 - **RAG 语义检索**：基于 LanceDB 的代码向量索引，提升大仓库的上下文召回质量
@@ -218,6 +276,17 @@ pytest --cov=app --cov-report=term-missing
 
 完整配置参考：[config/settings.yaml.example](config/settings.yaml.example)
 
+### 多轮审查配置（V4.0）
+
+```yaml
+multiround:
+  enabled: true            # 启用多轮审查
+  max_rounds: 3           # 最大审查轮次
+  auto_approve: false      # 自动批准（无需用户确认）
+  convergence_threshold: 2 # 连续无新问题的轮次阈值，达到后自动停止
+  user_input_timeout: 30   # 用户输入超时时间（秒）
+```
+
 ### 零依赖模式
 
 ```yaml
@@ -239,6 +308,17 @@ rag:
   top_k: 10
 ```
 
+### 前缀缓存
+
+```yaml
+llm:
+  roles:
+    reviewer:
+      prefix_caching: true   # 为支持的 Provider 启用前缀缓存
+    fixer:
+      prefix_caching: true
+```
+
 ## 开发指南
 
 ```bash
@@ -254,31 +334,55 @@ pytest --cov=app --cov-report=term-missing
 
 # 运行指定测试模块
 pytest tests/unit/test_critic.py -v
+
+# 运行多轮审查测试
+pytest tests/unit/test_multiround.py -v
+
+# 运行前缀缓存测试
+pytest tests/unit/test_prefix_caching.py -v
 ```
 
 ### 项目结构
 
 ```
-app/
-├── agents/          # LangGraph Agent 编排
-│   ├── workflow.py  # StateGraph 定义
-│   ├── nodes/       # reviewer, fixer, critic, tester, error_recovery
-│   └── prompts/     # Agent system prompts
-├── api/             # FastAPI 端点 (webhook, approval)
-├── cli/             # Typer CLI 入口
-├── core/            # 核心业务逻辑 (config, diff_analyzer, llm_factory, repo_mapper)
-├── infra/           # 基础设施 (queue, worker, checkpointer, circuit_breaker, hitl)
-├── rag/             # RAG 语义检索 (LanceDB indexer)
-├── sandbox/         # 沙盒引擎 (Docker, Shell, Null)
-├── schemas/         # Pydantic/TypedDict 数据模型
-├── tools/           # LangChain @tool 函数
-├── utils/           # 工具类 (PatchApplier)
-└── vcs/             # VCS 平台抽象 (GitLab, GitHub)
-tests/
-├── conftest.py      # 公共 fixtures
-├── unit/            # 单元测试
-├── integration/     # 集成测试
-└── fixtures/        # 测试数据
+AutoReviewer-MAS/
+├── app/
+│   ├── agents/
+│   │   ├── nodes/
+│   │   │   ├── reviewer.py          # Reviewer 审查节点
+│   │   │   ├── fixer.py             # Fixer 修复节点
+│   │   │   ├── critic.py            # Critic 规则检查节点
+│   │   │   ├── reduce_reviewer.py   # Map-Reduce 聚合节点
+│   │   │   ├── decision.py          # 多轮决策逻辑
+│   │   │   ├── user_checkpoint.py   # 用户交互检查点
+│   │   │   └── error_recovery.py    # 错误恢复（指数退避）
+│   │   ├── prompts/                 # Agent System Prompts
+│   │   ├── workflow.py              # 单轮审查 Graph
+│   │   └── workflow_multiround.py   # 多轮交互式审查 Graph
+│   ├── cli/
+│   │   ├── main.py                  # CLI 入口（Typer）
+│   │   └── interactive.py           # 交互式会话管理
+│   ├── core/
+│   │   ├── config.py                # 配置加载
+│   │   ├── diff_analyzer.py         # Diff 切片与语言检测
+│   │   ├── llm_factory.py           # LLM 实例工厂（含重试）
+│   │   ├── cache_utils.py           # 前缀缓存工具
+│   │   └── language_matrix.py       # 9 语言配置矩阵
+│   ├── schemas/
+│   │   ├── state.py                 # ReviewState TypedDict
+│   │   ├── llm_out.py               # LLM 结构化输出模型
+│   │   └── user_input.py            # 用户输入事件模型
+│   └── utils/
+│       ├── instruction_parser.py    # 自然语言指令解析器
+│       └── patch_applier.py         # Search/Replace 应用器
+├── config/
+│   └── settings.yaml.example        # 配置模板
+├── tests/
+│   └── unit/
+│       ├── test_multiround.py       # 多轮审查测试（38 个用例）
+│       └── test_prefix_caching.py   # 前缀缓存测试（10 个用例）
+├── CLAUDE.md
+└── README.md
 ```
 
 ## 许可证
