@@ -3,10 +3,10 @@
 在 fixer_node 生成代码后、进入 tester_node 的沙盒验证前，
 串入 critic_node 进行规则化快速检查。
 
-纯规则检查（无 LLM 调用）：
-- search/replace 是否为空或过短
-- 括号/引号是否匹配
-- search 和 replace 是否完全相同（无意义修改）
+检查策略：
+- 严格拒绝：空 search、search 与 replace 完全相同
+- 仅警告：括号不匹配（Vue/TypeScript 模板语法天然导致误报）
+- 实际匹配验证由 PatchApplier 在写入时执行
 """
 
 import logging
@@ -18,14 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 async def critic_node(state: ReviewState) -> Dict[str, Any]:
-    """Critic 节点函数 - 规则化快速检查（零 LLM 开销）。
-
-    使用纯规则检查 Fixer 输出的 SearchReplaceBlock：
-    1. search/replace 是否为空或过短
-    2. 括号/引号是否匹配
-    3. search 和 replace 是否完全相同（无意义修改）
-    4. search 是否包含足够的上下文
-    """
+    """Critic 节点函数 - 规则化快速检查（零 LLM 开销）。"""
     blocks = state.get("search_replace_blocks", [])
 
     if not blocks:
@@ -34,42 +27,52 @@ async def critic_node(state: ReviewState) -> Dict[str, Any]:
 
     logger.info("Critic 节点开始审查: %d 个 block", len(blocks))
 
-    # 规则化检查（零 LLM 开销）
-    issues = []
+    fatal_issues = []   # 导致拒绝的问题
+    warnings = []       # 仅警告，不拒绝
+
     for i, block in enumerate(blocks):
         search = block.get("search_block", block.get("search", ""))
         replace = block.get("replace_block", block.get("replace", ""))
         fp = block.get("file_path", "?")
 
-        # 规则 1: search 为空或过短
+        # ── 严格拒绝 ──
+
+        # search 为空或过短
         if not search or len(search.strip()) < 10:
-            issues.append(f"Block #{i+1} ({fp}): search 内容过短或为空")
+            fatal_issues.append(f"Block #{i+1} ({fp}): search 内容过短或为空")
 
-        # 规则 2: search 和 replace 完全相同
+        # search 和 replace 完全相同
         if search.strip() == replace.strip():
-            issues.append(f"Block #{i+1} ({fp}): search 和 replace 完全相同（无意义修改）")
+            fatal_issues.append(f"Block #{i+1} ({fp}): search 和 replace 完全相同")
 
-        # 规则 3: 括号不匹配
+        # replace 为空但 search 不为空（误删代码）
+        if search.strip() and not replace.strip():
+            fatal_issues.append(f"Block #{i+1} ({fp}): replace 为空，将删除代码")
+
+        # ── 仅警告（不拒绝）──
+
+        # 括号检查（Vue/TypeScript 模板 {{ }}、字符串中的括号会导致误报）
         for ch, name in [("(", "圆括号"), ("[", "方括号"), ("{", "花括号")]:
             close = {"(": ")", "[": "]", "{": "}"}[ch]
             if search.count(ch) != search.count(close):
-                issues.append(f"Block #{i+1} ({fp}): search 中{name}不匹配")
+                warnings.append(f"Block #{i+1} ({fp}): search 中{name}数量不等（可能是模板语法）")
             if replace.count(ch) != replace.count(close):
-                issues.append(f"Block #{i+1} ({fp}): replace 中{name}不匹配")
+                warnings.append(f"Block #{i+1} ({fp}): replace 中{name}数量不等")
 
-        # 规则 4: replace 为空但 search 不为空（可能误删代码）
-        if search.strip() and not replace.strip():
-            logger.warning("Block #%d (%s): replace 为空，可能删除了代码", i+1, fp)
+    # 输出警告（不阻断流程）
+    if warnings:
+        for w in warnings:
+            logger.warning("Critic 警告: %s", w)
 
-    if issues:
-        reason = "; ".join(issues)
+    # 仅 fatal 问题才拒绝
+    if fatal_issues:
+        reason = "; ".join(fatal_issues)
         logger.warning("Critic 拒绝: %s", reason)
-        # 注意：retry_count 由 workflow 层统一管理，Critic 不递增
         return {
             "search_replace_blocks": [],
             "test_logs": f"Critic 拒绝: {reason}",
             "is_test_passed": False,
         }
 
-    logger.info("Critic 通过: 所有 %d 个 block 规则检查合格", len(blocks))
+    logger.info("Critic 通过: %d 个 block 合格 (%d 个警告)", len(blocks), len(warnings))
     return {}
