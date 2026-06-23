@@ -192,7 +192,7 @@ def local(
     commit: str = typer.Option(None, "--commit", "-c", help="审查指定 commit 的变更 (SHA)"),
     commit_range: str = typer.Option(None, "--range", "-r", help="审查 commit 范围 (如 abc123..def456)"),
     full: bool = typer.Option(False, "--full", "-f", help="全量扫描（审查整个代码库，非增量）"),
-    max_rounds: int = typer.Option(5, "--max-rounds", "-m", help="最大审查轮次（默认 5）"),
+    max_rounds: int = typer.Option(5, "--max-rounds", "-m", help="最大审查轮次（收敛检测自动停止，默认 5）"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ):
     """🔍 审查本地代码变更。
@@ -212,8 +212,7 @@ def local(
     # 显示 Banner
     console.print(Panel.fit(
         "[bold cyan]🤖 AutoReviewer-MAS[/bold cyan]\n"
-        "[dim]本地伴随代码审查 · 多轮自动修复[/dim]\n"
-        f"[dim]最大轮次: {max_rounds}[/dim]",
+        "[dim]本地伴随代码审查 · 收敛自动修复[/dim]",
         border_style="cyan",
     ))
 
@@ -299,10 +298,13 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
     all_round_issues = []
     total_fixes_applied = 0
     current_diff = diff_text
+    prev_issue_count = -1  # -1 表示首轮
+    hard_limit = 10  # 防止无限循环的硬上限
 
-    while current_round < max_rounds:
+    while current_round < hard_limit:
         current_round += 1
-        console.print(f"\n[bold cyan]═══ 第 {current_round}/{max_rounds} 轮审查 ═══[/bold cyan]")
+        round_label = f"第 {current_round} 轮" if current_round == 1 else f"第 {current_round} 轮 (上轮 {prev_issue_count} 个问题)"
+        console.print(f"\n[bold cyan]═══ {round_label} ═══[/bold cyan]")
 
         # ── 准备阶段 ──
         detected = analyzer.detect_languages(current_diff)
@@ -413,13 +415,25 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
         console.print(table)
         console.print()
 
-        # ── 用户决策：是否修复 ──
+        # ── 收敛检测 ──
+        current_issue_count = len(issues)
         has_fixable = severity_counts["critical"] > 0 or severity_counts["warning"] > 0
 
         if not has_fixable:
             console.print("[green]✅ 仅有 info 级别提示，无需修复[/green]")
             break
 
+        # 非首轮：检查是否收敛
+        if prev_issue_count >= 0:
+            if current_issue_count >= prev_issue_count:
+                console.print(f"[yellow]📊 问题数未减少（{prev_issue_count} → {current_issue_count}），已收敛，停止修复[/yellow]")
+                break
+            else:
+                console.print(f"[green]📊 问题数减少（{prev_issue_count} → {current_issue_count}），继续修复[/green]")
+
+        prev_issue_count = current_issue_count
+
+        # ── 用户决策（仅首轮询问）──
         if current_round == 1:
             fix_target = "critical + warning" if severity_counts["critical"] == 0 else "critical"
             console.print(f"[bold]选择操作（目标: {fix_target} 问题）:[/bold]")
@@ -432,7 +446,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
                 console.print("[yellow]⏭️  已跳过修复，审查结束[/yellow]")
                 break
         else:
-            console.print(f"[yellow]🔄 继续自动修复剩余问题...[/yellow]")
+            console.print(f"[yellow]🔄 继续自动修复...[/yellow]")
 
         # ── 修复 ──
         fix_state = dict(review_state)
