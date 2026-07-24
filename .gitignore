@@ -37,3 +37,6 @@ Thumbs.db
 config/settings.yaml
 .claude/settings.json
 
+# Local persistent cache (auto-generated per project)
+.autoreviewer/
+

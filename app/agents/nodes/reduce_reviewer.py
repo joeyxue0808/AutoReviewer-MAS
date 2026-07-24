@@ -26,27 +26,57 @@ def reduce_reviewer_node(state: ReviewState) -> Dict[str, Any]:
     """Reviewer Reduce 节点 - 合并多个 reviewer 的审查结果。
 
     1. 收集所有 review_issues
-    2. 去重（相同文件+行号+描述）
+    2. 去重（相同文件+行号+描述）：轮内 + 跨轮（对比 round_issues 历史）+ 跨会话（持久缓存）
     3. 按严重级别排序（critical > warning > info）
     4. 合并输出
     """
     all_issues = state.get("review_issues", [])
-    
+
     logger.info(
         "Reduce Reviewer: 合并 %d 个审查问题",
         len(all_issues),
     )
-    
+
     if not all_issues:
         logger.info("Reduce Reviewer: 无审查问题，审查通过")
         return {"review_issues": []}
-    
-    # 去重：基于 file_path + line_number + description
+
+    # 跨轮去重：收集历史 round_issues 的去重键
+    historical_keys: set = set()
+    for issue in state.get("round_issues", []):
+        if isinstance(issue, dict):
+            historical_keys.add((
+                issue.get("file_path", ""),
+                issue.get("line_number", 0),
+                issue.get("description", ""),
+            ))
+        else:
+            historical_keys.add((
+                getattr(issue, "file_path", ""),
+                getattr(issue, "line_number", 0),
+                getattr(issue, "description", ""),
+            ))
+
+    # 跨会话去重：从持久缓存读取已知问题
+    repo_id = state.get("repo_id", "")
+    if repo_id:
+        try:
+            from app.core.persistent_cache import get_persistent_cache
+            persistent_issues = get_persistent_cache(repo_id).get_known_issues()
+            before = len(historical_keys)
+            historical_keys.update(persistent_issues)
+            added = len(historical_keys) - before
+            if added:
+                logger.info("跨会话去重: 加载 %d 个历史已知问题", added)
+        except Exception:
+            pass
+
+    # 轮内去重 + 跨轮去重
     seen = set()
     unique_issues: List[Dict[str, Any]] = []
-    
+    skipped_historical = 0
+
     for issue in all_issues:
-        # 兼容 dict 和对象格式
         if isinstance(issue, dict):
             fp = issue.get("file_path", "")
             ln = issue.get("line_number", 0)
@@ -55,43 +85,41 @@ def reduce_reviewer_node(state: ReviewState) -> Dict[str, Any]:
             fp = getattr(issue, "file_path", "")
             ln = getattr(issue, "line_number", 0)
             desc = getattr(issue, "description", "")
-        
-        # 生成去重键（使用完整描述，避免截断导致误判）
+
         dedup_key = (fp, ln, desc)
-        
-        if dedup_key not in seen:
-            seen.add(dedup_key)
-            unique_issues.append(issue)
-    
-    # 辅助函数：获取 issue 的 severity
+
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        if dedup_key in historical_keys:
+            skipped_historical += 1
+            continue
+
+        unique_issues.append(issue)
+
+    if skipped_historical:
+        logger.info("跨轮去重: 过滤 %d 个历史已报告问题", skipped_historical)
+
     def _get_severity(issue):
         if isinstance(issue, dict):
             return issue.get("severity", "info")
-        else:
-            return getattr(issue, "severity", "info")
-    
-    # 按严重级别排序
+        return getattr(issue, "severity", "info")
+
     def sort_key(issue):
-        severity = _get_severity(issue)
-        return _SEVERITY_ORDER.get(severity, 99)
-    
+        return _SEVERITY_ORDER.get(_get_severity(issue), 99)
+
     sorted_issues = sorted(unique_issues, key=sort_key)
-    
-    # 统计各级别数量（标准化 severity 到已知级别）
+
     def _normalize_severity(severity):
-        """将 severity 标准化为已知的三种级别之一。"""
         severity = severity.lower() if isinstance(severity, str) else "info"
-        if severity in _SEVERITY_ORDER:
-            return severity
-        # 未知 severity 归为 info
-        return "info"
-    
+        return severity if severity in _SEVERITY_ORDER else "info"
+
     severity_counts = {"critical": 0, "warning": 0, "info": 0}
     for issue in sorted_issues:
-        severity = _get_severity(issue)
-        normalized_severity = _normalize_severity(severity)
-        severity_counts[normalized_severity] += 1
-    
+        sev = _normalize_severity(_get_severity(issue))
+        severity_counts[sev] += 1
+
     logger.info(
         "Reduce Reviewer: 去重后 %d 个问题 (critical=%d, warning=%d, info=%d)",
         len(sorted_issues),
@@ -99,8 +127,17 @@ def reduce_reviewer_node(state: ReviewState) -> Dict[str, Any]:
         severity_counts["warning"],
         severity_counts["info"],
     )
-    
-    return {"review_issues": sorted_issues}
+
+    # 将本次新发现的问题写入持久缓存
+    repo_id = state.get("repo_id", "")
+    if repo_id:
+        try:
+            from app.core.persistent_cache import get_persistent_cache
+            get_persistent_cache(repo_id).add_known_issues(sorted_issues)
+        except Exception:
+            pass
+
+    return {"review_issues": sorted_issues, "deduplicated_issues": sorted_issues}
 
 
 def _normalize_issue(issue: Dict[str, Any]) -> Dict[str, Any]:

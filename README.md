@@ -88,13 +88,19 @@ __start__ → router_node → Send(reviewer_node) × N
 ### Installation
 
 ```bash
+# Clone and enter repo
 git clone https://github.com/joeyxue0808/AutoReviewer-MAS.git
 cd AutoReviewer-MAS
+
+# Install dependencies
 pip install -r requirements.txt
+
+# [Recommended] Install as editable package for use from any directory
+pip install -e .
 
 # Copy and edit config
 cp config/settings.yaml.example config/settings.yaml
-# Edit settings.yaml with your API keys
+# Edit settings.yaml with your API keys (MIMO_API_KEY, etc.)
 ```
 
 ### Environment Variables
@@ -112,39 +118,58 @@ cp config/settings.yaml.example config/settings.yaml
 
 ### Usage
 
-**CLI Local Review (single-round):**
+> 💡 After running `pip install -e .`, you can use `python -m app.cli.main` from **any project directory**.
+
+---
+
+**Mode 1: Local Auto-Fix Review (recommended for daily use)**
+
+Automatically reviews changes and iteratively fixes issues in a convergence loop (max 5 rounds):
 
 ```bash
-# Review all working tree changes
+# Review working tree changes (staged + unstaged)
 python -m app.cli.main local
 
-# Review only staged changes
-python -m app.cli.main local --staged
+# Review against another branch
+python -m app.cli.main local --branch main
 
-# Review diff against another branch
-python -m app.cli.main local --branch feature/auth
+# Review a specific commit
+python -m app.cli.main local --commit abc1234
+
+# Review a commit range
+python -m app.cli.main local --range abc1234..def5678
 
 # Full codebase scan
 python -m app.cli.main local --full
+
+# Set max review rounds
+python -m app.cli.main local --max-rounds 3
+
+# Verbose logging
+python -m app.cli.main local --verbose
 ```
 
-**CLI Multi-Round Interactive Review (V4.0):**
+The auto-fix loop will:
+1. Review diff → display issues → filter out deleted-file issues
+2. Auto-fix (with configurable countdown if `auto_approve` is enabled)
+3. Re-run review → check convergence → stop when no new issues appear
+4. Generate final report with remaining issue breakdown
+
+---
+
+**Mode 2: Multi-Round Interactive Review (V4.0)**
+
+Interactive session with real-time user intervention via LangGraph `interrupt()`:
 
 ```bash
-# Multi-round review with interactive user input
 python -m app.cli.main multiround
-
-# Set maximum review rounds
-python -m app.cli.main multiround --max-rounds 5
-
-# Auto-approve mode (no user confirmation needed)
+python -m app.cli.main multiround --max-rounds 10
 python -m app.cli.main multiround --auto-approve
-
-# Multi-round review against a branch
 python -m app.cli.main multiround --branch feature/auth
+python -m app.cli.main multiround --full
 ```
 
-During multi-round review, you can interact with the system in real-time:
+Supported interactive commands during review:
 
 | Command | Action |
 |---------|--------|
@@ -152,17 +177,26 @@ During multi-round review, you can interact with the system in real-time:
 | `n` / `no` / `否` | Reject fixes |
 | `stop` / `停止` | Stop execution |
 | `skip` / `跳过` | Skip current round |
-| `忽略性能问题` | Ignore issues in specific category |
-| `只关注安全问题` | Focus on specific category only |
+| `忽略性能问题` | Ignore specific category |
+| `只关注安全问题` | Focus on specific category |
 | `检查 auth.py` | Focus on specific file |
-| `最多修2次` | Set max review rounds |
+| `最多修2次` | Set max rounds |
 
-**API Server (webhook mode):**
+---
+
+**Mode 3: API Server (webhook mode)**
+
+For GitLab/GitHub webhook integration:
+
 ```bash
 python main.py
-# Webhook endpoints:
-#   POST /api/v1/webhook/gitlab
-#   POST /api/v1/webhook/github
+# POST /api/v1/webhook/gitlab
+# POST /api/v1/webhook/github
+```
+
+**Worker process** (consumes Redis queue):
+```bash
+python -m app.infra.worker
 ```
 
 ### Testing
@@ -177,10 +211,16 @@ pytest --cov=app --cov-report=term-missing
 ### V4.0 (Current)
 
 - **Multi-Round Interactive Review**: Real-time user intervention via LangGraph `interrupt()` mechanism
-- **Intelligent Instruction Parser**: Natural language command parsing
+- **Intelligent Instruction Parser**: Natural language command parsing ("忽略性能问题", "只关注安全问题")
 - **Map-Reduce Aggregation**: `reduce_reviewer_node` deduplicates concurrent reviewer results
-- **Convergence Detection**: Auto-stops after consecutive zero-issue rounds
+- **Convergence Detection**: Auto-stops after issues plateau or increase
 - **User Checkpoint Node**: Issue summaries and user approval/rejection
+- **Two-Tier Caching**:
+  - **Memory LRU cache**: Per-process in-memory file content cache (microsecond)
+  - **Persistent disk cache**: Per-project `.autoreviewer/cache.json`, survives restarts, stores file contents (with mtime validation), Repo-Maps, and known issues for cross-session dedup
+- **Convergence-Aware Final Report**: Distinguishes "converged" vs "max rounds reached" vs "unfixable issues"
+- **Deleted-File Filtering**: Automatically skips issues on deleted files before sending to Fixer
+- **Auto-Approve Buffer**: 3-second countdown before applying fixes
 - **Prefix Caching**: System prompts with `cache_control` for supported LLM providers
 
 ### V3.0
@@ -272,14 +312,17 @@ AutoReviewer-MAS/
 │   │   ├── workflow.py              # Single-round graph
 │   │   └── workflow_multiround.py   # Multi-round interactive graph
 │   ├── cli/
-│   │   ├── main.py                  # CLI entry point
+│   │   ├── main.py                  # CLI entry point (Typer)
 │   │   └── interactive.py           # Interactive session manager
 │   ├── core/
 │   │   ├── config.py                # Settings loader
-│   │   ├── diff_analyzer.py         # Diff chunking
+│   │   ├── diff_analyzer.py         # Diff chunking & language detection
 │   │   ├── llm_factory.py           # LLM factory with retry
 │   │   ├── cache_utils.py           # Prefix caching
-│   │   └── language_matrix.py       # 9-language matrix
+│   │   ├── file_cache.py            # In-memory LRU file cache + persistent backend binding
+│   │   ├── persistent_cache.py      # Per-project JSON cache (.autoreviewer/cache.json)
+│   │   ├── repo_mapper.py           # Repo-Map generation (tree-sitter AST / os.walk)
+│   │   └── language_matrix.py       # 9-language config matrix
 │   ├── schemas/
 │   │   ├── state.py                 # ReviewState TypedDict
 │   │   ├── llm_out.py               # LLM output models

@@ -17,6 +17,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# 收敛阈值 - 从配置加载，连续 N 轮零问题即收敛
+_convergence_threshold: int = settings.multiround.convergence_threshold
+
 
 def decision_node(state: ReviewState) -> Dict[str, Any]:
     """决策节点 - 更新轮次状态并记录报告。
@@ -142,27 +145,23 @@ def _check_user_stop_command(instructions: str, current_round: int) -> str:
 
 
 def _check_convergence(state: ReviewState) -> bool:
-    """检查是否收敛（连续无新问题）。"""
+    """检查是否收敛（连续无新问题）。
+
+    使用配置中的 convergence_threshold（默认 2），
+    即连续 N 轮问题数为 0 时认为收敛。
+    """
     round_reports = state.get("round_reports", [])
-    
-    # 至少需要两轮才能检查收敛
-    if len(round_reports) < 2:
+    threshold = _convergence_threshold
+
+    if len(round_reports) < threshold:
         return False
-    
-    # 检查最后两轮的报告
-    last_report = round_reports[-1]
-    previous_report = round_reports[-2]
-    
-    last_issues_count = last_report.get("issues_count", 0)
-    previous_issues_count = previous_report.get("issues_count", 0)
-    
-    # 如果连续两轮问题数量都为0，认为收敛
-    if last_issues_count == 0 and previous_issues_count == 0:
+
+    # 检查最近 N 轮的问题数是否都为 0
+    last_n = round_reports[-threshold:]
+    if all(r.get("issues_count", 0) == 0 for r in last_n):
+        logger.info("收敛检测: 连续 %d 轮零问题，判定收敛", threshold)
         return True
-    
-    # 如果连续两轮问题数量相同且不为0，也可能收敛（但需要更复杂的检查）
-    # 这里简化处理，只检查是否为0
-    
+
     return False
 
 
@@ -173,9 +172,9 @@ def after_critic(state: ReviewState) -> str:
     1. 如果有 critical 问题，回到 fixer_node
     2. 如果没有问题，进入决策节点
     """
-    review_issues = state.get("review_issues", [])
+    _issues = state.get("deduplicated_issues", state.get("review_issues", []))
     critical_issues = [
-        issue for issue in review_issues
+        issue for issue in _issues
         if (issue.get("severity") if isinstance(issue, dict) else getattr(issue, "severity", "")) == "critical"
     ]
     
@@ -191,13 +190,13 @@ def after_reviewer_multiround(state: ReviewState) -> str:
     """审查节点后的路由逻辑（多轮版本）。"""
     # 检查错误恢复
     if state.get("error_type"):
-        logger.info("审查节点出错 (%s)，进入错误恢复", state["error_type"])
+        logger.info("审查节点出错 (%s)", state["error_type"])
         return "error_recovery_node"
     
-    # 检查是否有问题需要修复
-    review_issues = state.get("review_issues", [])
+    # 使用去重后的问题列表
+    _issues = state.get("deduplicated_issues", state.get("review_issues", []))
     critical_issues = [
-        issue for issue in review_issues
+        issue for issue in _issues
         if (issue.get("severity") if isinstance(issue, dict) else getattr(issue, "severity", "")) == "critical"
     ]
     

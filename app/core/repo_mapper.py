@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 # tree-sitter 可用性（延迟检测）
 _ts_available: Optional[bool] = None
 
+# 会话级 Repo-Map 缓存，多轮间避免重复生成
+_repo_map_cache: dict[str, str] = {}
+
 # 跳过的目录
 _SKIP_DIRS = {
     "node_modules", ".git", "__pycache__", "venv", ".venv",
@@ -47,10 +50,11 @@ def _check_tree_sitter() -> bool:
 
 
 def generate_repo_map(repo_path: str, max_files: int = 200) -> str:
-    """生成 Repo-Map（全局上下文）。
+    """生成 Repo-Map（全局上下文），带两级缓存（内存 + 持久化）。
 
     优先使用 tree-sitter 提取 AST 签名树，
     降级为 os.walk 精简目录树。
+    多轮审查间自动命中内存缓存，跨 CLI 执行命中 .autoreviewer/cache.json。
 
     Args:
         repo_path: 仓库根目录路径
@@ -59,16 +63,54 @@ def generate_repo_map(repo_path: str, max_files: int = 200) -> str:
     Returns:
         Repo-Map 文本字符串，注入 ReviewState["repo_context"]
     """
+    global _repo_map_cache
+
+    # 1. 内存缓存
+    if repo_path in _repo_map_cache:
+        logger.debug("Repo-Map 内存缓存命中: %s", repo_path)
+        return _repo_map_cache[repo_path]
+
+    # 2. 持久缓存
+    try:
+        from app.core.persistent_cache import get_persistent_cache
+        cached = get_persistent_cache(repo_path).get_repo_map()
+        if cached is not None:
+            _repo_map_cache[repo_path] = cached
+            logger.info("Repo-Map 持久缓存命中: %s (%d chars)", repo_path, len(cached))
+            return cached
+    except Exception:
+        pass
+
     if not os.path.isdir(repo_path):
         return f"(仓库路径不存在: {repo_path})"
 
     if _check_tree_sitter():
         try:
-            return _generate_ast_map(repo_path, max_files)
+            result = _generate_ast_map(repo_path, max_files)
         except Exception as e:
             logger.warning("tree-sitter AST 解析失败，降级为目录树: %s", e)
+            result = _generate_dir_tree(repo_path, max_depth=4)
+    else:
+        result = _generate_dir_tree(repo_path, max_depth=4)
 
-    return _generate_dir_tree(repo_path, max_depth=4)
+    _repo_map_cache[repo_path] = result
+
+    try:
+        from app.core.persistent_cache import get_persistent_cache
+        get_persistent_cache(repo_path).set_repo_map(result)
+    except Exception:
+        pass
+
+    logger.info("Repo-Map 已生成: %s (%d chars)", repo_path, len(result))
+    return result
+
+
+def invalidate_repo_map_cache(repo_path: Optional[str] = None) -> None:
+    global _repo_map_cache
+    if repo_path:
+        _repo_map_cache.pop(repo_path, None)
+    else:
+        _repo_map_cache.clear()
 
 
 # ─────────────────────────────────────────────

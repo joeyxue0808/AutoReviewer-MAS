@@ -20,6 +20,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 # Windows 控制台默认 GBK 编码，强制 UTF-8 以支持 emoji 和中文
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -253,25 +255,39 @@ def local(
 
 
 def _display_diff_summary(diff_text: str) -> None:
-    """显示 Diff 概览表格。"""
+    """显示 Diff 概览表格（全量文件 + 每文件增减行数）。"""
     import re
 
     files = re.findall(r"^diff --git a/(.+?) b/(.+?)$", diff_text, re.MULTILINE)
-    additions = len(re.findall(r"^\+[^+]", diff_text, re.MULTILINE))
-    deletions = len(re.findall(r"^-[^-]", diff_text, re.MULTILINE))
+
+    # 统计每文件增减行数
+    file_stats: dict[str, dict[str, int]] = {}
+    current_file = None
+    for line in diff_text.splitlines():
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)$", line)
+        if m:
+            current_file = m.group(2)
+            file_stats.setdefault(current_file, {"additions": 0, "deletions": 0})
+            continue
+        if current_file and line.startswith("+"):
+            file_stats[current_file]["additions"] += 1
+        elif current_file and line.startswith("-"):
+            file_stats[current_file]["deletions"] += 1
+
+    total_additions = sum(s["additions"] for s in file_stats.values())
+    total_deletions = sum(s["deletions"] for s in file_stats.values())
 
     table = Table(title="📋 变更概览", show_lines=True)
     table.add_column("文件", style="cyan")
-    table.add_column("状态", style="green")
+    table.add_column("++", style="green", justify="right")
+    table.add_column("--", style="red", justify="right")
 
-    for _, new_path in files[:20]:  # 最多显示 20 个文件
-        table.add_row(new_path, "modified")
-
-    if len(files) > 20:
-        table.add_row(f"... 还有 {len(files) - 20} 个文件", "")
+    for new_path in dict.fromkeys(fp for _, fp in files):
+        stats = file_stats.get(new_path, {})
+        table.add_row(new_path, str(stats.get("additions", 0)), str(stats.get("deletions", 0)))
 
     console.print(table)
-    console.print(f"[green]+{additions}[/green] / [red]-{deletions}[/red] 行")
+    console.print(f"[green]+{total_additions}[/green] / [red]-{total_deletions}[/red] 行，共 {len(files)} 个文件")
 
 
 async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: int = 3) -> None:
@@ -283,9 +299,11 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
     3. 如果用户选择修复：
        a. Fixer 修复 → 写入磁盘
        b. 重新获取最新 diff → 再次审查
-       c. 如果还有 critical 问题，继续修复
-       d. 循环直到没有 critical 问题或达到最大轮次
+
+    使用持久化缓存避免冷启动。
     """
+    from app.core.file_cache import init_file_cache
+    init_file_cache(repo_root)
     from app.agents.workflow import build_review_only_graph, build_fix_only_graph
     from app.core.diff_analyzer import DiffAnalyzer
     from app.schemas.state import ReviewState
@@ -297,6 +315,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
     current_round = 0
     all_round_issues = []
     total_fixes_applied = 0
+    total_deleted_skipped = 0
     current_diff = diff_text
     prev_issue_count = -1  # -1 表示首轮
     hard_limit = 10  # 防止无限循环的硬上限
@@ -360,7 +379,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
 
             progress.update(task, description="[green]✅ 审查完成[/green]")
 
-        issues = review_state.get("review_issues", [])
+        issues = review_state.get("deduplicated_issues", review_state.get("review_issues", []))
 
         # ── 无问题 ──
         if not issues:
@@ -373,7 +392,7 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
 
         all_round_issues.extend(issues)
 
-        # ── 逐条展示问题 ──
+        # ── 逐条展示问题（去重后）──
         severity_counts = {"critical": 0, "warning": 0, "info": 0}
         for issue in issues:
             sev = issue.get("severity", "info")
@@ -415,7 +434,35 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
         console.print(table)
         console.print()
 
-        # ── 收敛检测 ──
+        # ── 过滤已删除文件的问题（Fixer 无法修复）──
+        deleted_files = set()
+        import re as _re_mod
+        for _m in _re_mod.finditer(r"^diff --git a/.+? b/(.+?)$", current_diff, _re_mod.MULTILINE):
+            _path = _m.group(1)
+            _rest = current_diff[_m.end():]
+            _next_diff = _rest.find("\ndiff --git ")
+            _block = _rest[:_next_diff] if _next_diff > 0 else _rest
+            if "+++ /dev/null" in _block:
+                deleted_files.add(_path)
+        _deleted_issues = 0
+        if deleted_files:
+            _before = len(issues)
+            issues = [i for i in issues if i.get("file_path", "") not in deleted_files]
+            _deleted_now = _before - len(issues)
+            total_deleted_skipped += _deleted_now
+            if _deleted_now:
+                console.print(f"[yellow]⚠️  跳过 {_deleted_now} 个已删除文件的问题（无法自动修复）[/yellow]")
+        if not issues:
+            console.print("[yellow]⚠️  所有问题均与已删除文件相关，停止循环[/yellow]")
+            break
+
+        # 重新计算过滤后的问题分布
+        severity_counts = {"critical": 0, "warning": 0, "info": 0}
+        for issue in issues:
+            sev = issue.get("severity", "info")
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+        # ── 收敛检测（基于可修复的问题）──
         current_issue_count = len(issues)
         has_fixable = severity_counts["critical"] > 0 or severity_counts["warning"] > 0
 
@@ -426,29 +473,82 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
         # 非首轮：检查是否收敛
         if prev_issue_count >= 0:
             if current_issue_count >= prev_issue_count:
-                console.print(f"[yellow]📊 问题数未减少（{prev_issue_count} → {current_issue_count}），已收敛，停止修复[/yellow]")
+                direction = "增加" if current_issue_count > prev_issue_count else "持平"
+                console.print(f"[yellow]📊 可修复问题{direction}（{prev_issue_count} → {current_issue_count}），停止修复[/yellow]")
                 break
             else:
-                console.print(f"[green]📊 问题数减少（{prev_issue_count} → {current_issue_count}），继续修复[/green]")
+                console.print(f"[green]📊 可修复问题减少（{prev_issue_count} → {current_issue_count}），继续修复[/green]")
 
         prev_issue_count = current_issue_count
 
         # ── 用户决策（仅首轮询问）──
         if current_round == 1:
-            fix_target = "critical + warning" if severity_counts["critical"] == 0 else "critical"
-            console.print(f"[bold]选择操作（目标: {fix_target} 问题）:[/bold]")
-            console.print("  [cyan]y[/cyan] — 自动修复")
-            console.print("  [cyan]n[/cyan] — 跳过，不修复")
-            console.print()
+            from app.core.config import settings as _cfg
+            if _cfg.multiround.auto_approve:
+                console.print("[green]✅ auto_approve 已启用[/green]")
+                console.print("[dim]即将自动修复以上问题（按 Ctrl+C 取消）[/dim]")
+                import time
+                for remaining in range(3, 0, -1):
+                    console.print(f"[dim]  {remaining}...[/dim]", end="\r")
+                    time.sleep(1)
+                console.print()
+                console.print("[green]▶️  开始修复[/green]")
+            else:
+                severity_counts = {"critical": 0, "warning": 0, "info": 0}
+                for issue in issues:
+                    sev = issue.get("severity", "info")
+                    severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
-            choice = console.input("[bold green]是否修复？(y/N) > [/bold green]").strip().lower()
-            if choice != "y":
-                console.print("[yellow]⏭️  已跳过修复，审查结束[/yellow]")
-                break
+                fix_target = "critical + warning" if severity_counts["critical"] == 0 else "critical"
+                console.print(f"[bold]选择操作（目标: {fix_target} 问题）:[/bold]")
+                console.print("  [cyan]y[/cyan] — 自动修复")
+                console.print("  [cyan]n[/cyan] — 跳过")
+                console.print("  [cyan]只修复critical问题[/cyan] — 自然语言指令")
+                console.print()
+
+                choice = console.input("[bold green]指令？(y/N) > [/bold green]").strip().lower()
+
+                if choice == "y":
+                    pass
+                else:
+                    from app.utils.instruction_parser import parse_instruction, format_instruction_summary
+                    parsed = parse_instruction(choice)
+                    summary = format_instruction_summary(parsed)
+                    console.print(f"[dim]解析: {summary}[/dim]")
+
+                    if parsed.action == "stop":
+                        console.print("[yellow]⏹  用户要求停止[/yellow]")
+                        raise typer.Exit(0)
+
+                    # 检测 severity 级别过滤（如"只修复critical问题"）
+                    sev_filter = set()
+                    for sev, sev_kws in {"critical": ["critical", "严重", "崩溃", "阻断"], "warning": ["warning", "警告"]}.items():
+                        if any(kw in choice for kw in sev_kws):
+                            sev_filter.add(sev)
+                    if sev_filter:
+                        filtered = [i for i in issues if i.get("severity", "info") in sev_filter]
+                        if filtered:
+                            issues = filtered
+                            console.print(f"[green]🎯 只修复 {list(sev_filter)} 级别: {len(issues)} 个问题[/green]")
+                        else:
+                            console.print("[yellow]⚠️  过滤后无问题，跳过修复[/yellow]")
+                            break
+                        del sev_filter
+                    elif parsed.action == "focus" and parsed.categories:
+                        allowed = {c.lower() for c in parsed.categories}
+                        filtered = [i for i in issues if i.get("category", "").lower() in allowed]
+                        if filtered:
+                            issues = filtered
+                            console.print(f"[green]🎯 只关注 {parsed.categories}: {len(issues)} 个问题[/green]")
+                        else:
+                            console.print("[yellow]⚠️  未匹配到问题，跳过修复[/yellow]")
+                            break
+                    else:
+                        console.print("[yellow]⏭️  无法识别指令，跳过[/yellow]")
+                        break
         else:
             console.print(f"[yellow]🔄 继续自动修复...[/yellow]")
 
-        # ── 修复 ──
         fix_state = dict(review_state)
         fix_state["search_replace_blocks"] = []
         fix_state["test_logs"] = ""
@@ -457,6 +557,8 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
         fix_state["error_count"] = 0
         fix_state["error_type"] = ""
         fix_state["last_node"] = ""
+        # 将过滤后的问题注入 fix_state，让 fixer 只处理这些
+        fix_state["deduplicated_issues"] = issues
 
         with Progress(
             SpinnerColumn(),
@@ -506,30 +608,37 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
             break
 
     # ── 最终报告 ──
+    # 判断停止原因
+    _stopped_by_no_issues = not issues and current_round > 0
+    _stopped_by_convergence = not _stopped_by_no_issues and prev_issue_count >= 0
+    _stopped_by_max_rounds = current_round >= hard_limit
+    _stopped_by_unfixable = False
+
     console.print(f"\n[bold cyan]═══ 审查完成（共 {current_round} 轮）═══[/bold cyan]")
     if total_fixes_applied:
         console.print(f"[green]📝 共写入 {total_fixes_applied} 个文件的修改[/green]")
 
     if all_round_issues:
-        severity_counts = {"critical": 0, "warning": 0, "info": 0}
+        # 统计所有轮次发现的全部问题（含已删除文件）
+        _total_sev = {"critical": 0, "warning": 0, "info": 0}
         for issue in all_round_issues:
             sev = issue.get("severity", "info")
-            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            _total_sev[sev] = _total_sev.get(sev, 0) + 1
+        _total_badges = []
+        if _total_sev["critical"]:
+            _total_badges.append(f"{_total_sev['critical']} critical")
+        if _total_sev["warning"]:
+            _total_badges.append(f"{_total_sev['warning']} warning")
+        if _total_sev["info"]:
+            _total_badges.append(f"{_total_sev['info']} info")
 
-        badges = []
-        if severity_counts["critical"]:
-            badges.append(f"[bold red]🔴 Critical: {severity_counts['critical']}[/bold red]")
-        if severity_counts["warning"]:
-            badges.append(f"[yellow]🟡 Warning: {severity_counts['warning']}[/yellow]")
-        if severity_counts["info"]:
-            badges.append(f"[blue]🔵 Info: {severity_counts['info']}[/blue]")
+        # 仅统计与已删除文件无关的问题（即最后检查时的 issues）
+        _remaining = len(issues) if not _stopped_by_no_issues else 0
 
-        console.print(f"[bold]📊 累计发现 {len(all_round_issues)} 个问题 — {' | '.join(badges)}[/bold]")
-
-        if severity_counts["critical"] == 0 and severity_counts["warning"] == 0:
+        if _remaining == 0:
             if current_round > 1:
                 console.print(Panel(
-                    "[bold green]🎉 所有问题已修复[/bold green]",
+                    "[bold green]🎉 所有问题已修复或已收敛 — 当前 diff 无未解决问题[/bold green]",
                     border_style="green",
                     padding=(0, 2),
                 ))
@@ -539,24 +648,75 @@ async def _run_review(diff_text: str, branch: str, repo_root: str, max_rounds: i
                     border_style="green",
                     padding=(0, 2),
                 ))
-        elif severity_counts["critical"] == 0:
-            console.print(Panel(
-                f"[bold yellow]📋 仍有 {severity_counts['warning']} 个 warning 问题（无 critical）[/bold yellow]",
-                border_style="yellow",
-                padding=(0, 2),
-            ))
         else:
+            # 有剩余问题
+            _rem_sev = {"critical": 0, "warning": 0, "info": 0}
+            for issue in issues:
+                sev = issue.get("severity", "info")
+                _rem_sev[sev] = _rem_sev.get(sev, 0) + 1
+            _rem_badges = []
+            if _rem_sev["critical"]:
+                _rem_badges.append(f"🔴 Critical: {_rem_sev['critical']}")
+            if _rem_sev["warning"]:
+                _rem_badges.append(f"🟡 Warning: {_rem_sev['warning']}")
+
+            _reason = ""
+            if _stopped_by_max_rounds:
+                _reason = f"（已达最大 {hard_limit} 轮上限）"
+            elif _stopped_by_unfixable:
+                _reason = "（无法自动修复）"
+            else:
+                _reason = "（已收敛，不再新增）"
+
             console.print(Panel(
-                f"[bold red]⚠️  还有 {severity_counts['critical']} 个 critical 问题未修复（已达最大轮次）[/bold red]",
+                f"[bold red]⚠️  还有 {' | '.join(_rem_badges)} 问题未修复{_reason}[/bold red]",
                 border_style="red",
                 padding=(0, 2),
             ))
+
+        # 补充累计发现提示（置于下方，非主体）
+        if _total_sev["critical"] or _total_sev["warning"]:
+            _deleted_hint = ""
+            if total_deleted_skipped > 0:
+                _deleted_hint = f"，其中 {total_deleted_skipped} 个与已删除文件相关"
+            console.print(f"[dim]📊 各轮累计共发现 {len(all_round_issues)} 个问题{_deleted_hint}[/dim]")
+            console.print()
     else:
         console.print(Panel(
             "[bold green]✅ 未发现问题 — 代码审查通过[/bold green]",
             border_style="green",
             padding=(0, 2),
         ))
+
+    # ── 下一步指引 ──
+    _has_remaining = False
+    try:
+        _has_remaining = len(issues) > 0
+    except Exception:
+        pass
+    if _has_remaining:
+        console.print()
+        _suggestions = [
+            "  • [cyan]python -m app.cli.main local --full[/cyan] — 全量扫描，发现更多隐藏问题",
+            "  • [cyan]python -m app.cli.main multiround --max-rounds 10[/cyan] — 多轮交互模式，每轮可确认是否继续",
+        ]
+        if total_deleted_skipped > 0:
+            _suggestions.append("  • 手动检查已删除的引用文件，确认是否可以安全删除相关引用")
+        else:
+            _suggestions.append("  • 手动检查剩余问题，确认是否需要保留相关代码")
+        console.print(Panel(
+            "[bold yellow]💡 下一步建议:[/bold yellow]\n" + "\n".join(_suggestions),
+            border_style="yellow",
+            padding=(0, 2),
+        ))
+
+    # 持久化缓存
+    try:
+        from app.core.persistent_cache import save_all
+        save_all()
+        logger.debug("持久化缓存已保存")
+    except Exception:
+        pass
 
 
 def _prompt_issue_selection(issues: list) -> list:
@@ -952,6 +1112,9 @@ async def _run_multiround_review(
     auto_approve: bool = False,
 ) -> None:
     """执行多轮交互式审查流水线。"""
+    from app.core.file_cache import init_file_cache
+    init_file_cache(repo_root)
+
     from app.agents.workflow_multiround import build_multiround_graph
     from app.core.diff_analyzer import DiffAnalyzer
     from app.cli.interactive import InteractiveSession, RealTimeDisplay
@@ -1071,9 +1234,14 @@ async def _run_multiround_review(
     finally:
         await session.stop()
 
-    # ── 将修复写入磁盘 ──
-    # 注意：多轮模式下修复已在循环中逐步应用
-    # 这里可以输出统计信息
+    # 持久化缓存
+    try:
+        from app.core.persistent_cache import save_all
+        save_all()
+        logger.debug("持久化缓存已保存")
+    except Exception:
+        pass
+
     console.print("\n[dim]审查流程已完成[/dim]")
 
 

@@ -99,13 +99,19 @@ __start__ → router_node → Send(reviewer_node) × N
 ### 安装
 
 ```bash
+# 克隆并进入仓库
 git clone https://github.com/joeyxue0808/AutoReviewer-MAS.git
 cd AutoReviewer-MAS
+
+# 安装依赖
 pip install -r requirements.txt
+
+# [推荐] 以可编辑模式安装，之后可在任意目录下使用
+pip install -e .
 
 # 复制并编辑配置
 cp config/settings.yaml.example config/settings.yaml
-# 编辑 settings.yaml 填入 API Key 等配置
+# 编辑 settings.yaml 填入 API Key 等配置（MIMO_API_KEY 等）
 ```
 
 ### 环境变量
@@ -141,71 +147,58 @@ $env:GITHUB_TOKEN = "你的GitHub Token"
 
 ### 使用方式
 
-**CLI 本地审查（在任意项目目录下审查代码）：**
+> 💡 执行 `pip install -e .` 后，可在**任意项目目录**下直接使用 `python -m app.cli.main`。
 
-> ⚠️ **重要**：CLI 需要能 `import app` 模块，因此必须让 Python 能找到 AutoReviewer-MAS 的路径。
-> 有两种方式：
+---
 
-**方式一 — 以可编辑模式安装（推荐，一次配置永久生效）：**
+**模式一：本地自动修复审查（推荐日常使用）**
+
+自动审查代码变更并以收敛循环迭代修复问题（默认最多 5 轮）：
+
 ```bash
-# 在 AutoReviewer-MAS 目录下安装一次：
-cd /path/to/AutoReviewer-MAS
-pip install -e .
-
-# 然后在任意项目目录下直接使用：
-cd /path/to/your-project
-
-# 审查工作区全部变更（暂存+未暂存，默认模式）
+# 审查工作区全部变更（暂存+未暂存）
 python -m app.cli.main local
 
-# 仅审查暂存区
-python -m app.cli.main local --staged
-
 # 与指定分支对比
-python -m app.cli.main local --branch feature/auth
+python -m app.cli.main local --branch main
 
 # 审查某个 commit 的变更
 python -m app.cli.main local --commit abc1234
 
-# 审查 commit 范围的变更（多提交）
+# 审查 commit 范围的变更
 python -m app.cli.main local --range abc1234..def5678
 
 # 全量扫描整个代码库
 python -m app.cli.main local --full
+
+# 指定最大修复轮次
+python -m app.cli.main local --max-rounds 3
+
+# 显示详细日志
+python -m app.cli.main local --verbose
 ```
 
-**方式二 — 设置 PYTHONPATH 环境变量：**
-```bash
-# 每次使用前设置 PYTHONPATH 指向 AutoReviewer-MAS 目录：
-export PYTHONPATH=/path/to/AutoReviewer-MAS
+自动修复循环流程：
+1. Reviewer 审查 diff → 展示问题 → 自动过滤已删除文件的问题
+2. Fixer 自动修复（`auto_approve` 启用时有 3 秒倒计时可取消）
+3. 重新审查 → 收敛检测 → 无新问题时自动停止
+4. 生成最终报告（区分"已收敛"/"已达上限"/"无法自动修复"）
 
-# 然后在任意项目目录下：
-cd /path/to/your-project
-python -m app.cli.main local
-```
+---
 
-> 💡 Windows PowerShell 用户使用：`$env:PYTHONPATH = "D:\path\to\AutoReviewer-MAS"`
+**模式二：多轮交互式审查（V4.0）**
 
-**CLI 多轮交互式审查（V4.0 新功能）：**
+通过 LangGraph `interrupt()` 机制实现每轮可实时干预的交互式审查：
 
 ```bash
-# 多轮交互式审查，支持实时输入指令
 python -m app.cli.main multiround
-
-# 指定最大审查轮次
-python -m app.cli.main multiround --max-rounds 5
-
-# 自动批准模式（无需用户确认）
+python -m app.cli.main multiround --max-rounds 10
 python -m app.cli.main multiround --auto-approve
-
-# 与指定分支对比的多轮审查
 python -m app.cli.main multiround --branch feature/auth
-
-# 全量扫描的多轮审查
 python -m app.cli.main multiround --full
 ```
 
-多轮审查过程中，支持以下实时交互指令：
+支持的实时交互指令：
 
 | 指令 | 动作 |
 |------|------|
@@ -219,7 +212,12 @@ python -m app.cli.main multiround --full
 | `最多修2次` | 设置最大审查轮次 |
 | `3次修复后停止` | 到达轮次后停止 |
 
-**API 服务（Webhook 模式）：**
+---
+
+**模式三：API 服务（Webhook 模式）**
+
+用于 GitLab/GitHub Webhook 集成：
+
 ```bash
 python main.py
 # Webhook 端点:
@@ -227,7 +225,7 @@ python main.py
 #   POST /api/v1/webhook/github
 ```
 
-**Worker 进程：**
+**Worker 进程**（消费 Redis 队列）：
 ```bash
 python -m app.infra.worker
 ```
@@ -247,8 +245,14 @@ pytest --cov=app --cov-report=term-missing
 - **多轮交互式审查**：基于 LangGraph `interrupt()` 机制的实时用户干预
 - **智能指令解析**：自然语言指令解析（"忽略性能问题"、"只关注安全问题"、"3次修复后停止"）
 - **Map-Reduce 聚合**：`reduce_reviewer_node` 对并发 reviewer 结果去重、按严重级别排序
-- **收敛检测**：连续无新问题的轮次自动停止
+- **收敛检测**：问题持平或增加时自动停止，避免无效循环
 - **用户检查点**：展示问题摘要，等待用户批准/拒绝
+- **两级缓存系统**：
+  - **内存 LRU 缓存**：进程内文件内容缓存（微秒级）
+  - **持久化磁盘缓存**：每个项目 `.autoreviewer/cache.json`，跨进程/跨重启持久化，缓存文件内容（带 mtime 校验）、Repo-Map、已知问题（跨会话去重）
+- **收敛感知报告**：区分"已收敛"/"已达最大轮次"/"无法自动修复"
+- **删除文件自动过滤**：Fixer 执行前自动跳过已删除文件的问题
+- **自动修复缓冲**：`auto_approve` 模式有 3 秒倒计时可取消
 - **前缀缓存**：System Prompt 标记 `cache_control`，支持 Claude 3.5/vLLM 等 Provider
 
 ### V3.0
@@ -367,6 +371,9 @@ AutoReviewer-MAS/
 │   │   ├── diff_analyzer.py         # Diff 切片与语言检测
 │   │   ├── llm_factory.py           # LLM 实例工厂（含重试）
 │   │   ├── cache_utils.py           # 前缀缓存工具
+│   │   ├── file_cache.py            # 内存 LRU 文件缓存 + 持久化后端绑定
+│   │   ├── persistent_cache.py      # 项目级持久化缓存 (.autoreviewer/cache.json)
+│   │   ├── repo_mapper.py           # Repo-Map 生成器（tree-sitter AST / os.walk 降级）
 │   │   └── language_matrix.py       # 9 语言配置矩阵
 │   ├── schemas/
 │   │   ├── state.py                 # ReviewState TypedDict

@@ -59,6 +59,10 @@ def router_node(state: ReviewState) -> List[Dict[str, Any]]:
     - 大 MR：切分为多个 DiffChunk，通过 Send 并发分发给多个 reviewer_node
     - 小 MR：直接发送给单个 reviewer_node
     """
+    from app.core.file_cache import get_file_cache, init_file_cache
+    init_file_cache(state.get("repo_id", ""))
+    get_file_cache().clear()
+
     diff_chunks = state.get("diff_chunks", {})
     detected = state.get("detected_languages", [])
     

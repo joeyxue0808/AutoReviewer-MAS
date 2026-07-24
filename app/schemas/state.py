@@ -17,6 +17,23 @@ from typing import Annotated, Any, Dict, List, Optional, TypedDict
 from pydantic import BaseModel, Field, field_validator
 
 
+def _error_type_first(current: str, update: str) -> str:
+    """合并并发写入的 error_type：保留第一个非空值。
+
+    LangGraph 迭代调用 reducer(current, update) 处理多个并发写入。
+    当 Send 并发多个 reviewer_node 同时失败时，
+    各自写入不同的错误类型，取第一个有意义的值即可（都进入 error_recovery 路由）。
+    """
+    if current:
+        return current
+    return update
+
+
+def _node_name_last(old: str, new: str) -> str:
+    """合并并发写入的 last_node：保留最后一个非空值。"""
+    return new if new else old
+
+
 # ─────────────────────────────────────────────
 # 审查问题模型
 # ─────────────────────────────────────────────
@@ -91,7 +108,9 @@ class ReviewState(TypedDict):
     # ── 审查结果 ──
     # Annotated[list, operator.add] 允许 Send API 并发多个 reviewer_node 同时写入，
     # 各自的结果会自动合并（列表拼接），而非冲突报错
-    review_issues: Annotated[List[Dict[str, Any]], operator.add]  # Reviewer Agent 发现的问题
+    review_issues: Annotated[List[Dict[str, Any]], operator.add]  # Reviewer Agent 发现的问题（合并后未去重）
+    # 去重后的审查问题（by reduce_reviewer_node），无 operator.add，后写覆盖前写
+    deduplicated_issues: List[Dict[str, Any]]
 
     # ── Fixer 输出（Search/Replace 格式）──
     search_replace_blocks: List[Dict[str, Any]]  # Fixer 输出的搜索/替换块
@@ -100,11 +119,15 @@ class ReviewState(TypedDict):
     test_logs: str  # Tester 沙盒执行后的日志
     is_test_passed: bool  # 测试是否通过
     retry_count: int  # Fixer <-> Tester 的循环重试次数
-    error_count: int  # 连续错误计数（429 等，用于防止死循环）
+    # Annotated 允许 Send API 并发多个节点同时写入 error_count，
+    # 每个节点写入 delta=1，reducer 自动累加：0 + 1 + 1 = 2（两个并发错误）
+    error_count: Annotated[int, operator.add]  # 连续错误计数（429 等，用于防止死循环）
 
     # ── 错误恢复 (V3.0) ──
-    error_type: str  # 错误类型: "429" / "timeout" / "connection" / ""
-    last_node: str  # 出错的节点名（用于 error_recovery 路由回原节点）
+    # error_type 也需要 Annotated 处理并发写入：优先保留更具体的错误类型
+    error_type: Annotated[str, _error_type_first]  # 错误类型: "429" / "timeout" / "connection" / "auth" / ""
+    # last_node 也需要 Annotated 处理并发写入：保留最后一个写入的节点名
+    last_node: Annotated[str, _node_name_last]  # 出错的节点名（用于 error_recovery 路由回原节点）
 
     # ── 多轮审查控制 (V4.0) ──
     current_round: int  # 当前轮次（从 0 开始）

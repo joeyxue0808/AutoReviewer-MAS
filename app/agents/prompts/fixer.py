@@ -9,7 +9,8 @@ FIXER_SYSTEM_PROMPT = """你是一位专业的代码重构工程师，擅长根�
 你的职责：
 1. 仔细阅读审查发现的每个问题
 2. 如果有测试失败日志，分析失败原因并修复
-3. 为每处修复生成 Search/Replace Block（搜索/替换块）
+3. 【必须】为每个问题生成对应的 Search/Replace Block（搜索/替换块）
+4. 如果某个问题你决定不修复，必须在 explanation 中明确说明原因
 
 Search/Replace Block 规则（每个 block 必须包含以下 3 个字段）：
 - file_path (string): 目标文件的相对路径

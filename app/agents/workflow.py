@@ -55,6 +55,10 @@ def router_node(state: ReviewState) -> List[Dict[str, Any]]:
     Returns:
         Send 指令列表，每个元素是要发送给 reviewer_node 的状态片段
     """
+    from app.core.file_cache import get_file_cache, init_file_cache
+    init_file_cache(state.get("repo_id", ""))
+    get_file_cache().clear()
+
     from langgraph.types import Send
 
     diff_chunks = state.get("diff_chunks", {})
@@ -133,8 +137,10 @@ def _after_reviewer(state: ReviewState) -> Literal["fixer_node", "error_recovery
         logger.info("Reviewer 出错 (%s)，进入 error_recovery", state["error_type"])
         return "error_recovery_node"
 
+    # 使用去重后的问题列表（避免 operator.add 导致的问题翻倍）
+    issues = state.get("deduplicated_issues", state.get("review_issues", []))
     critical_issues = [
-        issue for issue in state.get("review_issues", [])
+        issue for issue in issues
         if (issue.get("severity") if isinstance(issue, dict) else getattr(issue, "severity", "")) == "critical"
     ]
 
@@ -239,7 +245,8 @@ async def submit_node(state: ReviewState) -> Dict[str, Any]:
 
     try:
         comments = [CommentPayload(body=report)]
-        for issue in state.get("review_issues", []):
+        issues = state.get("deduplicated_issues", state.get("review_issues", []))
+        for issue in issues:
             fp = issue.get("file_path", "") if isinstance(issue, dict) else getattr(issue, "file_path", "")
             ln = issue.get("line_number", 0) if isinstance(issue, dict) else getattr(issue, "line_number", 0)
             desc = issue.get("description", "") if isinstance(issue, dict) else getattr(issue, "description", "")
@@ -275,7 +282,7 @@ def _create_vcs_provider(provider_name: str):
 
 
 def _format_review_report(state: ReviewState) -> str:
-    issues = state.get("review_issues", [])
+    issues = state.get("deduplicated_issues", state.get("review_issues", []))
     test_logs = state.get("test_logs", "")
     is_passed = state.get("is_test_passed", False)
     retry_count = state.get("retry_count", 0)

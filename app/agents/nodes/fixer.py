@@ -34,7 +34,7 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
         state["retry_count"],
     )
 
-    issues = state.get("review_issues", [])
+    issues = state.get("deduplicated_issues", state.get("review_issues", []))
     detected = state.get("detected_languages", [])
     issues_text = _format_issues(issues)
 
@@ -79,6 +79,9 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
         if "429" in error_str:
             error_type = "429"
             logger.warning("Fixer 触发 rate limit (429)，保留已有结果")
+        elif "401" in error_str or "Invalid API Key" in error_str:
+            error_type = "auth"
+            logger.error("Fixer LLM 调用失败: API Key 无效或未配置，请检查 MIMO_API_KEY 环境变量或 settings.yaml")
         elif "timeout" in error_str.lower():
             error_type = "timeout"
         elif "connection" in error_str.lower():
@@ -88,7 +91,7 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
         return {
             "search_replace_blocks": state.get("search_replace_blocks", []),
             "retry_count": state["retry_count"],
-            "error_count": state.get("error_count", 0) + 1,
+            "error_count": 1,  # delta=1, reducer 自动累加
             "error_type": error_type,
             "last_node": "fixer_node",
         }
@@ -117,8 +120,13 @@ async def fixer_node(state: ReviewState) -> Dict[str, Any]:
 
 
 async def _preload_issue_file_contexts(issues: list) -> Dict[str, str]:
-    """从审查问题中提取文件路径，并发读取上下文。"""
+    """从审查问题中提取文件路径，并发读取上下文。
+
+    使用 file_cache 避免多轮间重复读盘。
+    """
     import asyncio
+
+    from app.core.file_cache import get_file_cache
 
     # 提取所有涉及的文件路径
     file_paths = set()
@@ -132,17 +140,27 @@ async def _preload_issue_file_contexts(issues: list) -> Dict[str, str]:
         return {}
 
     async def read_one(fp: str, ln: int) -> tuple[str, str]:
-        try:
-            if ln:
-                start = max(1, ln - _CONTEXT_LINES // 2)
-                end = ln + _CONTEXT_LINES // 2
-                content = await read_file_context.ainvoke({
-                    "file_path": fp, "start_line": start, "end_line": end,
-                })
-            else:
-                content = await read_file_context.ainvoke({"file_path": fp})
-        except Exception:
-            content = f"(无法读取 {fp})"
+        cache = get_file_cache()
+        if ln:
+            start = max(1, ln - _CONTEXT_LINES // 2)
+            end = ln + _CONTEXT_LINES // 2
+            content = cache.get(fp, start, end)
+            if content is None:
+                try:
+                    content = await read_file_context.ainvoke({
+                        "file_path": fp, "start_line": start, "end_line": end,
+                    })
+                    cache.set(fp, start, end, content)
+                except Exception:
+                    content = f"(无法读取 {fp})"
+        else:
+            content = cache.get(fp, 1, 0)
+            if content is None:
+                try:
+                    content = await read_file_context.ainvoke({"file_path": fp})
+                    cache.set(fp, 1, 0, content)
+                except Exception:
+                    content = f"(无法读取 {fp})"
         content = str(content)
         if len(content) > 4000:
             content = content[:4000] + "\n... [截断]"

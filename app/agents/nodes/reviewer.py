@@ -124,14 +124,20 @@ async def reviewer_node(state: ReviewState) -> Dict[str, Any]:
             error_type = "unknown"
             if "429" in error_str:
                 error_type = "429"
+            elif "401" in error_str or "Invalid API Key" in error_str:
+                error_type = "auth"
+                logger.error("Reviewer LLM 调用失败: API Key 无效或未配置，请检查 MIMO_API_KEY 环境变量或 settings.yaml")
             elif "timeout" in error_str.lower():
                 error_type = "timeout"
             elif "connection" in error_str.lower():
                 error_type = "connection"
-            logger.error("Reviewer LLM 调用失败: %s (type=%s)", e, error_type)
+            if error_type == "unknown":
+                logger.error("Reviewer LLM 调用失败: %s (type=%s)", e, error_type)
             return {
                 "review_issues": [],
-                "error_count": state.get("error_count", 0) + 1,
+                "error_count": 1,  # delta=1, reducer 自动累加
+                "error_type": error_type,
+                "last_node": "reviewer_node",
             }
         logger.warning("LangChain 解析失败，已从原始输出中降级恢复 (%d 个问题)", len(output.issues))
 
@@ -159,9 +165,12 @@ async def reviewer_node(state: ReviewState) -> Dict[str, Any]:
 async def _preload_file_contexts(diff_text: str) -> Dict[str, str]:
     """从 diff 中提取文件路径，并发读取每个文件的变更区域上下文。
 
+    使用 file_cache 避免多轮间重复读盘。
     返回 {file_path: file_content} 字典。
     """
     import asyncio
+
+    from app.core.file_cache import get_file_cache
 
     files = _DIFF_FILE_PATTERN.findall(diff_text)
     if not files:
@@ -174,50 +183,51 @@ async def _preload_file_contexts(diff_text: str) -> Dict[str, str]:
     async def read_one(file_path: str) -> tuple[str, str]:
         lines = changed_lines.get(file_path, [])
         if lines:
-            # 按连续行号分组为独立 hunk（间隔 > 20 行视为不同 hunk）
             hunks = _group_into_hunks(lines, gap=20)
             if len(hunks) == 1:
-                # 单 hunk：围绕变更区域读取
                 center = (hunks[0][0] + hunks[0][-1]) // 2
                 start = max(1, center - _CONTEXT_LINES // 2)
                 end = center + _CONTEXT_LINES // 2
-                try:
-                    content = await read_file_context.ainvoke({
-                        "file_path": file_path,
-                        "start_line": start,
-                        "end_line": end,
-                    })
-                except Exception:
-                    content = await read_file_context.ainvoke({"file_path": file_path})
+                content = _cached_read(file_path, start, end)
+                if content is None:
+                    try:
+                        content = await read_file_context.ainvoke({
+                            "file_path": file_path, "start_line": start, "end_line": end,
+                        })
+                    except Exception:
+                        content = await read_file_context.ainvoke({"file_path": file_path})
+                    _cache_set(file_path, start, end, content)
             else:
-                # 多 hunk：分别读取每个 hunk 的上下文
                 parts = []
                 for hunk in hunks:
                     center = (hunk[0] + hunk[-1]) // 2
                     start = max(1, center - _CONTEXT_LINES // 4)
                     end = center + _CONTEXT_LINES // 4
-                    try:
-                        part = await read_file_context.ainvoke({
-                            "file_path": file_path,
-                            "start_line": start,
-                            "end_line": end,
-                        })
-                        parts.append(str(part))
-                    except Exception:
-                        pass
+                    content = _cached_read(file_path, start, end)
+                    if content is None:
+                        try:
+                            content = await read_file_context.ainvoke({
+                                "file_path": file_path, "start_line": start, "end_line": end,
+                            })
+                            _cache_set(file_path, start, end, content)
+                        except Exception:
+                            content = None
+                    if content:
+                        parts.append(str(content))
                 content = "\n...\n".join(parts) if parts else f"(无法读取 {file_path})"
         else:
-            try:
-                content = await read_file_context.ainvoke({"file_path": file_path})
-            except Exception:
-                content = f"(无法读取 {file_path})"
-        # 截断过长内容
+            content = _cached_read(file_path, 1, 0)
+            if content is None:
+                try:
+                    content = await read_file_context.ainvoke({"file_path": file_path})
+                    _cache_set(file_path, 1, 0, content)
+                except Exception:
+                    content = f"(无法读取 {file_path})"
         content = str(content)
         if len(content) > 4000:
             content = content[:4000] + "\n... [截断]"
         return file_path, content
 
-    # 用 set 去重
     unique_files = list(set(fp for _, fp in files))
     tasks = [read_one(fp) for fp in unique_files]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -230,6 +240,16 @@ async def _preload_file_contexts(diff_text: str) -> Dict[str, str]:
         contexts[fp] = content
 
     return contexts
+
+
+def _cached_read(file_path: str, start: int, end: int) -> Optional[str]:
+    from app.core.file_cache import get_file_cache
+    return get_file_cache().get(file_path, start, end)
+
+
+def _cache_set(file_path: str, start: int, end: int, content) -> None:
+    from app.core.file_cache import get_file_cache
+    get_file_cache().set(file_path, start, end, str(content))
 
 
 def _extract_changed_lines(diff_text: str) -> Dict[str, List[int]]:
